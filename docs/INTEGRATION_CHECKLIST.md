@@ -6,7 +6,7 @@
 | Nandan | Receive request → POST /api/chat → structured actions | 501; connect approved orchestration |
 | Nandan and Jay | Use discovery and getSlots or GET /api/slots | Mock availability tested; Google credentials needed |
 | Jay | Choose returned time → POST /api/consent → POST /api/holds | Consent and lock tested; countdown uses expires_at |
-| Jay and Chinmay | POST /api/otp/send then /verify | Backend fixture passes; debugger-only delivery |
+| Jay and Chinmay | POST /api/otp/send then /verify | Backend fixture passes; opt-in local console delivery |
 | Jay and Chinmay | POST /api/payments/order → Checkout → /verify | Fixture passes; real Test Mode capture and race fixes pending |
 | Chinmay | POST /api/bookings/confirm with same holdId | Mock fixture passes; verify pending recovery before shared use |
 | Jay | GET /api/admin/appointments with a clinic admin token | Fixture verifies dashboard fields and omission of patient session credentials |

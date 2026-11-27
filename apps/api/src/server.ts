@@ -6,7 +6,7 @@ import { Engine,Fault,requireThat,equal,signature } from './core.js';
 import { type DB,transaction } from './db.js';
 import { GoogleAdapter,MockAdapter } from './adapters.js';
 import { Payments,RazorpayProvider,type PaymentProvider } from './payments.js';
-export function createApp(db:DB,options:{mockBase?:string;mockKey:string;otpSink?:(id:string,code:string)=>void;provider?:PaymentProvider;now?:()=>number;origins?:string[]} ){
+export function createApp(db:DB,options:{mockBase?:string;mockKey:string;webhookSecret?:string;otpSink?:(id:string,code:string,phone:string)=>void;provider?:PaymentProvider;now?:()=>number;origins?:string[]} ){
  const app=express();app.disable('x-powered-by');
  const engine:Engine=new Engine(db,clinic=>engine.clinic(clinic).adapter==='google'?new GoogleAdapter(process.env.GOOGLE_ACCESS_TOKEN??'',process.env.GOOGLE_CALENDAR_ID??''):new MockAdapter(options.mockBase??'http://127.0.0.1:4000/mock',clinic,options.mockKey),options.otpSink,options.now);
  const payments=new Payments(engine,options.provider??new RazorpayProvider(process.env.RAZORPAY_KEY_ID??'',process.env.RAZORPAY_KEY_SECRET??''));
@@ -14,7 +14,32 @@ export function createApp(db:DB,options:{mockBase?:string;mockKey:string;otpSink
  app.use((req,res,next)=>{res.locals.requestId=randomUUID();res.setHeader('Cache-Control','no-store');res.setHeader('X-Content-Type-Options','nosniff');const origin=req.headers.origin;if(origin){if(!(options.origins??['http://localhost:5173','http://localhost:5174']).includes(origin))return next(new Fault('ORIGIN_NOT_ALLOWED','Origin not allowed',403));res.setHeader('Access-Control-Allow-Origin',origin);res.setHeader('Vary','Origin');res.setHeader('Access-Control-Allow-Headers','Content-Type, Authorization, X-Clinic-Id, X-Session-Id');res.setHeader('Access-Control-Allow-Methods','GET,POST,PATCH,DELETE,OPTIONS');}if(req.method==='OPTIONS'){res.sendStatus(204);return;}next();});
  const limits=new Map<string,{count:number;reset:number}>();app.use((req,res,next)=>{const key=req.socket.remoteAddress??'unknown',now=Date.now();if(limits.size>10000)for(const [k,v] of limits)if(v.reset<now)limits.delete(k);let value=limits.get(key);if(!value||value.reset<now){value={count:0,reset:now+60000};limits.set(key,value);}if(++value.count>120)return next(new Fault('RATE_LIMIT','Try again later',429));next();});
  const ok=(res:Response,data:unknown,status=200)=>res.status(status).json({ok:true,data,requestId:res.locals.requestId});
- app.post('/api/payments/webhook',express.raw({type:'application/json',limit:'64kb'}),async(req,res)=>{const secret=process.env.RAZORPAY_WEBHOOK_SECRET;requireThat(secret,'WEBHOOK_NOT_CONFIGURED',undefined,503);requireThat(Buffer.isBuffer(req.body)&&equal(signature(secret,req.body.toString()),String(req.headers['x-razorpay-signature']??'')),'INVALID_WEBHOOK_SIGNATURE');const body=JSON.parse(req.body.toString());if(body.event==='payment.captured'){const p=body.payload?.payment?.entity;requireThat(typeof p?.order_id==='string'&&typeof p?.id==='string','INVALID_WEBHOOK');const row=engine.one('SELECT p.*,h.session_id FROM payments p JOIN holds h ON h.id=p.hold_id WHERE p.order_id=?',p.order_id);requireThat(row,'PAYMENT_NOT_FOUND');await payments.reconcile(row.clinic_id,row.session_id,row.hold_id,row.order_id,p.id);}ok(res,{received:true});});
+ app.post('/api/payments/webhook',express.raw({type:'application/json',limit:'64kb',inflate:false}),async(req,res)=>{
+  const secret=options.webhookSecret??process.env.RAZORPAY_WEBHOOK_SECRET;
+  requireThat(secret,'WEBHOOK_NOT_CONFIGURED',undefined,503);
+  requireThat(Buffer.isBuffer(req.body)&&equal(signature(secret,req.body),String(req.headers['x-razorpay-signature']??'')),'INVALID_WEBHOOK_SIGNATURE');
+  const hash=createHash('sha256').update(req.body).digest('hex');
+  const eventId=req.get('x-razorpay-event-id')??hash;
+  let parsed:unknown;
+  try {parsed=JSON.parse(req.body.toString('utf8'));} catch {throw new Fault('INVALID_WEBHOOK','Invalid webhook JSON');}
+  const body=z.object({event:z.string(),payload:z.unknown().optional()}).parse(parsed);
+  const prior=transaction(db,()=>{
+   engine.run('INSERT OR IGNORE INTO payment_webhook_events VALUES(?,?,NULL)',eventId,hash);
+   return engine.one('SELECT * FROM payment_webhook_events WHERE id=?',eventId)!;
+  });
+  requireThat(prior.body_hash===hash,'INVALID_WEBHOOK');
+  if(prior.processed_at===null){
+   if(body.event==='payment.captured'||body.event==='payment.failed'){
+    const payload=z.object({payment:z.object({entity:z.object({id:z.string().min(1),order_id:z.string().min(1)})})}).parse(body.payload);
+    const payment=payload.payment.entity;
+    const row=engine.one('SELECT p.*,h.session_id FROM payments p JOIN holds h ON h.id=p.hold_id WHERE p.order_id=?',payment.order_id);
+    requireThat(row,'PAYMENT_NOT_FOUND');
+    await payments.reconcile(row.clinic_id,row.session_id,row.hold_id,row.order_id,payment.id,body.event==='payment.failed');
+   }
+   engine.run('UPDATE payment_webhook_events SET processed_at=? WHERE id=? AND processed_at IS NULL',engine.now(),eventId);
+  }
+  ok(res,{received:true});
+ });
  app.use(express.json({limit:'32kb'}));
  app.get('/api/health',(_req,res)=>{db.prepare('SELECT 1').get();ok(res,{database:'sqlite',status:'ok',otp:'DEVELOPMENT_ONLY',notifications:'SIMULATED',googleConfigured:!!process.env.GOOGLE_ACCESS_TOKEN,razorpayConfigured:!!process.env.RAZORPAY_KEY_ID});});
  app.post('/api/sessions',(req,res)=>{const {clinicId}=z.object({clinicId:z.string()}).parse(req.body);engine.clinic(clinicId);const id=randomBytes(32).toString('hex');engine.run('INSERT INTO sessions VALUES(?,?,?,?)',id,clinicId,engine.now(),engine.now()+86400000);ok(res,{sessionId:id,clinicId,expiresAt:new Date(engine.now()+86400000).toISOString()},201);});
@@ -46,7 +71,7 @@ export function createApp(db:DB,options:{mockBase?:string;mockKey:string;otpSink
  app.get('/api/slots',async(req,res)=>{const p=contracts.slotQuery.parse(req.query);ok(res,await engine.available(res.locals.clinic,p.doctorId,p.serviceId,p.date));});
  app.post('/api/holds',async(req,res)=>ok(res,await engine.reserve(res.locals.clinic,res.locals.session,contracts.holdRequest.parse(req.body)),201));
  app.delete('/api/holds/:id',(req,res)=>{transaction(db,()=>{const h=engine.hold(res.locals.clinic,res.locals.session,String(req.params.id),false);requireThat(['HELD','OTP_VERIFIED','EXPIRED','CANCELLED'].includes(h.state),'INVALID_STATE');engine.run("UPDATE holds SET state='CANCELLED' WHERE id=?",h.id);});ok(res,{state:'CANCELLED'});});
- app.post('/api/otp/send',(req,res)=>{requireThat((process.env.OTP_MODE??'development')==='development'&&process.env.NODE_ENV!=='production','SMS_PROVIDER_NOT_CONFIGURED',undefined,503);const p=contracts.phoneRequest.parse(req.body);ok(res,engine.sendOtp(res.locals.clinic,res.locals.session,p.holdId,p.phone));});
+ app.post('/api/otp/send',(req,res)=>{requireThat(options.otpSink&&process.env.NODE_ENV!=='production','SMS_PROVIDER_NOT_CONFIGURED',undefined,503);const p=contracts.phoneRequest.parse(req.body);ok(res,engine.sendOtp(res.locals.clinic,res.locals.session,p.holdId,p.phone));});
  app.post('/api/otp/verify',(req,res)=>{const p=contracts.otpRequest.parse(req.body);ok(res,engine.verifyOtp(res.locals.clinic,res.locals.session,p.holdId,p.phone,p.code));});
  app.post('/api/payments/order',async(req,res)=>ok(res,await payments.order(res.locals.clinic,res.locals.session,contracts.holdIdRequest.parse(req.body).holdId)));
  app.post('/api/payments/verify',async(req,res)=>ok(res,await payments.verify(res.locals.clinic,res.locals.session,contracts.paymentVerifyRequest.parse(req.body))));
