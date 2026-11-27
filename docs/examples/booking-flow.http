@@ -1,0 +1,111 @@
+# Local, fictional data. Replace placeholders after each response.
+@base = http://127.0.0.1:4000
+@clinic = lotus
+@session = REPLACE_FROM_SESSION_RESPONSE
+@hold = REPLACE_FROM_HOLD_RESPONSE
+@booking = REPLACE_FROM_CONFIRM_RESPONSE
+@date = 2026-12-01
+@start = 2026-12-01T03:30:00.000Z
+@otp = REPLACE_FROM_LOCAL_DEVELOPMENT_SINK
+@token = REPLACE_FROM_ADMIN_LOGIN
+@adminPassword = REPLACE_FROM_LOCAL_ENV
+@order = REPLACE_FROM_CHECKOUT
+@payment = REPLACE_FROM_CHECKOUT
+@signature = REPLACE_FROM_CHECKOUT
+
+GET {{base}}/api/health
+
+###
+
+POST {{base}}/api/sessions
+Content-Type: application/json
+
+{"clinicId":"{{clinic}}"}
+
+###
+
+GET {{base}}/api/slots?doctorId=lotus-doctor&serviceId=lotus-consult&date={{date}}
+X-Clinic-Id: {{clinic}}
+X-Session-Id: {{session}}
+
+###
+
+POST {{base}}/api/consent
+Content-Type: application/json
+X-Clinic-Id: {{clinic}}
+X-Session-Id: {{session}}
+
+{"booking":true,"briefing":false}
+
+###
+
+POST {{base}}/api/holds
+Content-Type: application/json
+X-Clinic-Id: {{clinic}}
+X-Session-Id: {{session}}
+
+{"doctorId":"lotus-doctor","serviceId":"lotus-consult","start":"{{start}}"}
+
+###
+
+POST {{base}}/api/otp/send
+Content-Type: application/json
+X-Clinic-Id: {{clinic}}
+X-Session-Id: {{session}}
+
+{"holdId":"{{hold}}","phone":"+12025550123"}
+
+###
+
+POST {{base}}/api/otp/verify
+Content-Type: application/json
+X-Clinic-Id: {{clinic}}
+X-Session-Id: {{session}}
+
+{"holdId":"{{hold}}","phone":"+12025550123","code":"{{otp}}"}
+
+###
+
+POST {{base}}/api/payments/order
+Content-Type: application/json
+X-Clinic-Id: {{clinic}}
+X-Session-Id: {{session}}
+
+{"holdId":"{{hold}}"}
+
+###
+
+POST {{base}}/api/payments/verify
+Content-Type: application/json
+X-Clinic-Id: {{clinic}}
+X-Session-Id: {{session}}
+
+{"holdId":"{{hold}}","razorpay_order_id":"{{order}}","razorpay_payment_id":"{{payment}}","razorpay_signature":"{{signature}}"}
+
+###
+
+POST {{base}}/api/bookings/confirm
+Content-Type: application/json
+X-Clinic-Id: {{clinic}}
+X-Session-Id: {{session}}
+
+{"holdId":"{{hold}}"}
+
+###
+
+GET {{base}}/api/bookings/{{booking}}/calendar.ics
+X-Clinic-Id: {{clinic}}
+X-Session-Id: {{session}}
+
+###
+
+POST {{base}}/api/admin/login
+Content-Type: application/json
+
+{"email":"lotus@demo.invalid","password":"{{adminPassword}}"}
+
+###
+
+# Isolated local testing only. Do not share or log raw responses.
+GET {{base}}/api/admin/appointments?state=CONFIRMED
+Authorization: Bearer {{token}}

@@ -1,0 +1,40 @@
+# Nandan’s AI tool contract
+
+Call `executeTool(engine, name, input, {clinicId,sessionId})` from trusted server code. It rechecks clinic and session expiry and parses input with `toolArguments[name]` from the shared package. The model supplies only the arguments below. Empty objects have no required input. Unknown object keys are stripped by the current Zod object schemas. Invalid runtime tool names need an allowlist before dispatch. The function returns the value directly or throws; catch Zod errors and Faults, map them to safe codes, and never pass raw exceptions or rows to the model.
+
+| Tool | Input object schema | Result and conditions | When to call |
+|---|---|---|---|
+| getClinic | {} | Raw clinic record; project id, name and safe config | Greeting/settings |
+| getDoctors | {} | Array of {id:string,name:string} for active doctors | Doctor selection |
+| getServices | {} | Array of service records; project id, name, duration and fee | Service selection |
+| getSlots | {doctorId:string min 1,serviceId:string min 1,date:ISO date} | Array of {start:string,end:string}; adapter filters busy times | After doctor, service and date known |
+| holdSlot | {doctorId:string min 1,serviceId:string min 1,start:UTC ISO datetime} | Raw hold; project id/start/end/fee/expires_at/state. Requires latest booking consent. Locks capacity temporarily. | Only after patient selects an offered slot and consents |
+| getBooking | {bookingId:string} | Raw owned appointment; project display fields | Check status for a known booking |
+| cancelBooking | {bookingId:string} | Raw updated appointment; confirmed booking required unless already terminal. Cancels upstream and may record refund pending. | Explicit patient confirmation required by integration policy; shared use blocked pending concurrency fix |
+| rescheduleBooking | {bookingId:string,holdId:string} | Raw updated appointment; same doctor/service/fee and owned active replacement. | Explicit patient confirmation required by integration policy; shared use blocked pending concurrency fix |
+| getFAQs | {} | Array of {question:string,answer:string} | Clinic FAQ |
+| handoff | {} | {type:"HANDOFF",contact:string} | Unresolved requests, human assistance, or as part of following clinic emergency guidance |
+
+On SESSION_REQUIRED, stop and prompt the widget to restore its session. On SLOT_UNAVAILABLE, refresh. On confirmation or reschedule pending, describe pending status and avoid repeating an uncertain mutation automatically. Never infer success from a tool invocation. Raw hold and appointment tool results contain internal metadata and must pass through an allowlist before entering a model context.
+
+## Proposed chat protocol and actions
+
+`POST /api/chat` currently returns 501 after patient authentication. Proposed input is `{message:string,language:"en"|"kn"|"hi"}`, with conversation state held server-side and scoped to the authenticated session. Proposed success is `{message:string,language,actions:ChatAction[]}` inside the standard envelope. No conversation store is implemented. Existing shared action schemas are:
+
+- SELECT_SLOT with slots [{start,end}]
+- VERIFY_OTP with holdId
+- PAY with holdId, orderId, amount, currency "INR", keyId
+- CONFIRMED with bookingId and reference
+- HANDOFF with contact
+
+Consent, OTP send/verify, checkout, verified confirmation and briefing are HTTP capabilities, not existing AI tools. Prefer widget interactions for them. If orchestration wrappers are approved, use the same backend validators and trusted context. Keep OTP entry and checkout signatures outside model context. The booking service controls payment and confirmation. Accept only explicitly consented patient-reported briefing content after confirmation. Keep credentials, diagnoses and unnecessary patient information out of chat. Use actual slots, never assert payment or confirmation without backend evidence, and hand off medical advice or urgent requests.
+
+## Example journey
+
+These are proposed conversations. In each language, the widget then renders consent and time selection, collects OTP, opens checkout, waits for verified confirmation, and only then displays the booking reference. UI submissions can keep the conversational message count under five without skipping checks.
+
+| Language | Patient request | Assistant response after retrieving availability |
+|---|---|---|
+| English | I need a dental consultation tomorrow morning. | Please choose an available time below. We’ll ask for your consent before reserving it. |
+| Kannada | ನಾಳೆ ಬೆಳಿಗ್ಗೆ ದಂತ ವೈದ್ಯರ ಸಲಹೆ ಬೇಕು. | ಕೆಳಗೆ ಲಭ್ಯವಿರುವ ಸಮಯವನ್ನು ಆಯ್ಕೆ ಮಾಡಿ. ಸಮಯವನ್ನು ಕಾಯ್ದಿರಿಸುವ ಮೊದಲು ನಿಮ್ಮ ಒಪ್ಪಿಗೆ ಕೇಳುತ್ತೇವೆ. |
+| Hindi | मुझे कल सुबह दाँतों की जाँच करानी है। | नीचे उपलब्ध समय चुनें। समय आरक्षित करने से पहले हम आपकी सहमति लेंगे। |
