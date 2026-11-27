@@ -12,6 +12,8 @@ import { Engine } from '../../apps/api/src/core.js';
 import { ReconciliationWorker } from '../../apps/api/src/reconciliation.js';
 import { configureNotificationDelivery,NotificationWorker,type NotificationProvider } from '../../apps/api/src/notification-worker.js';
 import { enqueuePaymentNotice } from '../../apps/api/src/notification-outbox.js';
+import { approveRefund,RefundWorker } from '../../apps/api/src/refund-worker.js';
+import type { ProviderRefund } from '../../apps/api/src/payments.js';
 import { expireHolds,openDb,seed,transaction } from '../../apps/api/src/db.js';
 import { createApp } from '../../apps/api/src/server.js';
 import { signature } from '../../apps/api/src/core.js';
@@ -142,7 +144,8 @@ async function fixture(path = ':memory:'){
  async function verifiedHold(){await consent();const h=(await reserve()).data;await request('/api/otp/send','POST',{holdId:h.id,phone:'+919999999999'},session);const r=await request('/api/otp/verify','POST',{holdId:h.id,phone:'+919999999999',code:codes.get(h.id)},session);assert.equal(r.status,200);return h;}
  async function pay(id:string){const r=await request('/api/payments/order','POST',{holdId:id},session);assert.equal(r.status,200,JSON.stringify(r));const order=r.data;const paymentId=randomUUID();captured.set(paymentId,{order:order.orderId,amount:order.amount});const body={holdId:id,razorpay_order_id:order.orderId,razorpay_payment_id:paymentId,razorpay_signature:signature(provider.secret,`${order.orderId}|${paymentId}`)};return {body,verify:()=>request('/api/payments/verify','POST',body,session)};}
  async function webhook(eventId:string,event:string,id:string,order_id:string,valid=true){
-  const body=JSON.stringify({event,payload:{payment:{entity:{id,order_id}}}});
+  const payload=event.startsWith('refund.')?{refund:{entity:{id,payment_id:order_id}}}:{payment:{entity:{id,order_id}}};
+  const body=JSON.stringify({event,payload});
   return fetch(base+'/api/payments/webhook',{method:'POST',headers:{'Content-Type':'application/json','X-Razorpay-Event-Id':eventId,'X-Razorpay-Signature':valid?signature(webhookSecret,body):'invalid'},body});
  }
  return {...state,provider,db,request,webhook,session,codes,input,consent,reserve,verifiedHold,pay,advance:(ms:number)=>{now+=ms;},close:async()=>{server.closeAllConnections();await new Promise<void>(r=>server.close(()=>r()));db.close();}};
@@ -598,6 +601,138 @@ test('definitive failures retry and exhaust; ambiguous non-idempotent delivery n
   assert.equal(await ambiguous.runOnce(),true);
   assert.equal(await ambiguous.runOnce(),false);
   assert.equal(f.engine.one("SELECT last_error FROM notification_jobs WHERE event='REFUND_COMPLETED'")?.last_error,'AMBIGUOUS_DELIVERY');
+ }finally{await f.close();}
+});
+test('refund eligibility follows cutoff, late capture and clinic ownership',async()=>{
+ const f=await fixture();
+ try{
+  const close=await f.verifiedHold();
+  await (await f.pay(close.id)).verify();
+  const near=await f.engine.confirm('lotus',f.session,close.id);
+  assert.equal((await f.engine.cancel('lotus',f.session,near.id)).state,'CANCELLED');
+  assert.equal((await f.request('/api/holds/'+close.id+'/refund','GET',undefined,f.session)).data.status,'NOT_APPLICABLE');
+  f.input.start='2026-12-04T03:30:00.000Z';
+  const distant=await f.verifiedHold();
+  await (await f.pay(distant.id)).verify();
+  const future=await f.engine.confirm('lotus',f.session,distant.id);
+  const adapter=f.engine.adapters('lotus');
+  const cancel=adapter.cancelBooking.bind(adapter);
+  adapter.cancelBooking=async()=>{throw new Error('Outcome unknown');};
+  f.engine.adapters=()=>adapter;
+  await assert.rejects(f.engine.cancel('lotus',f.session,future.id));
+  assert.equal(f.engine.one('SELECT COUNT(*) n FROM refund_operations')?.n,0);
+  await cancel(future.external_id);
+  reconcileOffline(f.db,{kind:'CANCEL',clinicId:'lotus',holdId:distant.id,outcome:'applied'},f.engine.now());
+  const pending=f.engine.one("SELECT * FROM refund_operations WHERE reason='ELIGIBLE_CANCELLATION'")!;
+  assert.equal(pending.amount,distant.fee);
+  assert.equal(pending.approved_at,null);
+  assert.throws(()=>approveRefund(f.db,'harbor',pending.id),/not eligible/);
+  assert.equal((await f.request('/api/holds/'+distant.id+'/refund','GET',undefined,f.session,'harbor')).status,401);
+  const harbor=await f.request('/api/admin/login','POST',{email:'harbor@demo.invalid',password:'test-password-123'});
+  assert.deepEqual((await f.request('/api/admin/refunds','GET',undefined,undefined,'harbor',harbor.data.token)).data,[]);
+  const late=await f.verifiedHold();
+  const capture=await f.pay(late.id);
+  f.advance(301000);
+  assert.equal((await capture.verify()).data.state,'REFUND_PENDING');
+  assert.equal(f.engine.one("SELECT amount FROM refund_operations WHERE reason='EXPIRED_RESERVATION'")?.amount,late.fee);
+  assert.equal(await f.refunds.runOnce(),false);
+ }finally{await f.close();}
+});
+
+test('refund worker recovers a lost submission after lease expiry and completes only with verified provider evidence',async()=>{
+ const folder=mkdtempSync(join(tmpdir(),'clinic-refund-'));
+ const path=join(folder,'clinic.db');
+ try{
+  const f=await fixture(path);
+  try{
+   f.input.start='2026-12-04T03:30:00.000Z';
+   const hold=await f.verifiedHold();
+   const checkout=await f.pay(hold.id);
+   await checkout.verify();
+   const a=await f.engine.confirm('lotus',f.session,hold.id);
+   await f.engine.cancel('lotus',f.session,a.id);
+   const job=f.engine.one('SELECT * FROM refund_operations')!;
+   const paymentId=checkout.body.razorpay_payment_id;
+   const lookup=f.provider.payment.bind(f.provider);
+   let upstream:ProviderRefund|undefined, submissions=0;
+   const entered=signal(),release=signal();
+   f.provider.payment=async id=>({...await lookup(id),amount_refunded:upstream?.status==='processed'?hold.fee:0});
+   f.provider.refunds=async()=>upstream?[upstream]:[];
+   f.provider.refund=async()=>{if(!upstream)throw new Error('No refund');return upstream;};
+   f.provider.createRefund=async(id,amount,receipt)=>{
+    submissions++;
+    assert.equal(amount,hold.fee);
+    assert.equal(receipt,job.id);
+    upstream={id:'fixture-refund',payment_id:id,amount,currency:'INR',status:'pending',receipt};
+    entered.resolve();
+    await release.promise;
+    throw new Error('Lost create response');
+   };
+   approveRefund(f.db,'lotus',job.id,f.engine.now());
+   const initial=new RefundWorker(f.db,f.provider,true,f.engine.now);
+   const old=initial.runOnce();
+   await entered.promise;
+   const restarted=openDb(path);
+   try{
+    const worker=new RefundWorker(restarted,f.provider,false,f.engine.now);
+    assert.equal(await worker.runOnce(),false);
+    f.advance(60001);
+    assert.equal(await worker.runOnce(),true);
+    assert.equal(f.engine.one('SELECT status FROM refund_operations')?.status,'PROCESSING');
+    assert.equal(f.engine.one('SELECT state FROM payments')?.state,'REFUND_PENDING');
+    assert.ok(upstream);
+    upstream.status='processed';
+    const webhook=()=>f.webhook('fixture-refund-processed','refund.processed','fixture-refund',paymentId);
+    assert.equal((await webhook()).status,200);
+    assert.equal((await webhook()).status,200);
+    assert.equal((await f.webhook('fixture-refund-older','refund.created','fixture-refund',paymentId)).status,200);
+   }finally{restarted.close();release.resolve();await old;}
+   assert.equal(submissions,1);
+   assert.equal(f.engine.one('SELECT status FROM refund_operations')?.status,'COMPLETED');
+   assert.equal(f.engine.one('SELECT state FROM payments')?.state,'REFUNDED');
+   assert.equal(f.engine.booking('lotus',f.session,a.id).state,'REFUNDED');
+   assert.equal((await f.engine.cancel('lotus',f.session,a.id)).state,'REFUNDED');
+   assert.equal(f.engine.one("SELECT COUNT(*) n FROM notification_jobs WHERE event='REFUND_COMPLETED'")?.n,1);
+  }finally{await f.close();}
+ }finally{rmSync(folder,{recursive:true});}
+});
+
+test('refund worker rejects excess, prior refunds and provider failure without retrying submission',async()=>{
+ const f=await fixture();
+ try{
+  const hold=await f.verifiedHold();
+  const checkout=await f.pay(hold.id);
+  f.advance(301000);
+  await checkout.verify();
+  const job=f.engine.one('SELECT * FROM refund_operations')!;
+  f.engine.run('UPDATE refund_operations SET amount=amount+1 WHERE id=?',job.id);
+  assert.throws(()=>approveRefund(f.db,'lotus',job.id),/not eligible/);
+  f.engine.run('UPDATE refund_operations SET amount=? WHERE id=?',hold.fee,job.id);
+  const lookup=f.provider.payment.bind(f.provider);
+  f.provider.payment=async id=>({...await lookup(id),amount_refunded:0});
+  let evidence:ProviderRefund[]=[{id:'unrelated',payment_id:checkout.body.razorpay_payment_id,amount:100,currency:'INR',status:'processed'}];
+  let submissions=0;
+  f.provider.refunds=async()=>evidence;
+  f.provider.refund=async()=>evidence[0];
+  f.provider.createRefund=async (id,amount,receipt)=>{
+   submissions++;
+   evidence=[{id:'failed-refund',payment_id:id,amount,currency:'INR',status:'failed',receipt}];
+   return evidence[0];
+  };
+  approveRefund(f.db,'lotus',job.id,f.engine.now());
+  const worker=new RefundWorker(f.db,f.provider,true,f.engine.now);
+  assert.equal(await worker.runOnce(),true);
+  assert.equal(submissions,0);
+  assert.equal(f.engine.one('SELECT status FROM refund_operations')?.status,'MANUAL');
+  // A verified operator clears the fixture after establishing no prior refund exists.
+  evidence=[];
+  f.engine.run("UPDATE refund_operations SET status='PENDING',next_at=? WHERE id=?",f.engine.now(),job.id);
+  assert.equal(await worker.runOnce(),true);
+  assert.equal(await worker.runOnce(),false);
+  assert.equal(submissions,1);
+  assert.equal(f.engine.one('SELECT status FROM refund_operations')?.status,'MANUAL');
+  assert.equal(f.engine.one('SELECT state FROM payments')?.state,'REFUND_PENDING');
+  assert.equal(f.engine.one("SELECT COUNT(*) n FROM notification_jobs WHERE event='REFUND_COMPLETED'")?.n,0);
  }finally{await f.close();}
 });
 test('Google adapter fails closed without credentials',async()=>{await assert.rejects(()=>new GoogleAdapter('','').getSlots({doctorId:'x',start:'2026-12-01T00:00:00Z',end:'2026-12-02T00:00:00Z'}),/Google Calendar credentials/);});

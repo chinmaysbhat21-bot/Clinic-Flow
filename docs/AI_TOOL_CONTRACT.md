@@ -1,5 +1,7 @@
 # Nandan’s AI tool contract
 
+Use the [refund contract](REFUND_SETUP.md) for authoritative refund states. Keep pending, processing, completed and manual review distinct. Never infer a bank credit date from booking cancellation or provider processing.
+
 Call `executeTool(engine, name, input, {clinicId,sessionId})` from trusted server code. It rechecks clinic and session expiry and parses input with `toolArguments[name]` from the shared package. The model supplies only the arguments below. Empty objects have no required input. Unknown object keys are stripped by the current Zod object schemas. Invalid runtime tool names need an allowlist before dispatch. The function returns the value directly or throws; catch Zod errors and Faults, map them to safe codes, and never pass raw exceptions or rows to the model.
 
 | Tool | Input object schema | Result and conditions | When to call |

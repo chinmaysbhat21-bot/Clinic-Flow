@@ -3,7 +3,7 @@ import type { DB } from './db.js';
 
 export const channels=['CONSOLE','EMAIL','SMS','WHATSAPP'] as const;
 export type Channel=typeof channels[number];
-export type NotificationEvent='CONFIRMATION'|'CANCELLATION'|'RESCHEDULE'|'REMINDER'|'PAYMENT_CONFIRMED'|'REFUND_PENDING'|'REFUND_COMPLETED'|'BRIEFING';
+export type NotificationEvent='CONFIRMATION'|'CANCELLATION'|'RESCHEDULE'|'REMINDER'|'PAYMENT_CONFIRMED'|'REFUND_PENDING'|'REFUND_COMPLETED'|'REFUND_REVIEW'|'BRIEFING';
 
 export function reminderMinutes(raw=process.env.NOTIFICATION_REMINDER_MINUTES):number[]{
  const values=(raw??'1440,60').split(',').map(Number);
@@ -47,9 +47,9 @@ export function enqueueBookingNotice(db:DB,clinicId:string,appointmentId:string,
 }
 
 /** Called inside the transaction that commits a verified payment or refund transition. */
-export function enqueuePaymentNotice(db:DB,holdId:string,event:'PAYMENT_CONFIRMED'|'REFUND_PENDING'|'REFUND_COMPLETED',now:number){
+export function enqueuePaymentNotice(db:DB,holdId:string,event:'PAYMENT_CONFIRMED'|'REFUND_PENDING'|'REFUND_COMPLETED'|'REFUND_REVIEW',now:number){
  const payment=db.prepare('SELECT * FROM payments WHERE hold_id=?').get(holdId);
- const required={PAYMENT_CONFIRMED:'VERIFIED',REFUND_PENDING:'REFUND_PENDING',REFUND_COMPLETED:'REFUNDED'}[event];
+ const required={PAYMENT_CONFIRMED:'VERIFIED',REFUND_PENDING:'REFUND_PENDING',REFUND_COMPLETED:'REFUNDED',REFUND_REVIEW:'REFUND_PENDING'}[event];
  if(!payment||payment.state!==required)return;
  const appointment=db.prepare('SELECT id FROM appointments WHERE hold_id=? AND clinic_id=?').get(holdId,payment.clinic_id);
  enqueue(db,{event,key:holdId+':'+event,clinicId:String(payment.clinic_id),appointmentId:appointment?String(appointment.id):null,kind:event,when:now,holdId});

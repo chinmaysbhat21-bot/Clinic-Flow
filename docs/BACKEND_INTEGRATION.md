@@ -14,6 +14,7 @@ Express routes validate with Zod and call Engine or Payments. Engine owns SQLite
 | RAZORPAY_WEBHOOK_SECRET | Optional signed capture webhook; use raw request body |
 | GOOGLE_ACCESS_TOKEN, GOOGLE_CALENDARS_JSON, GOOGLE_CALENDAR_ID | Scoped OAuth demo token and clinic-specific calendar map. Legacy ID applies only to Harbor. See [Google Calendar setup](GOOGLE_CALENDAR_SETUP.md). |
 | NOTIFICATION_MODE, NOTIFICATION_POLL_MS, NOTIFICATION_REMINDER_MINUTES | Optional local console worker, polling and reminder offsets. See [notification setup](NOTIFICATION_SETUP.md). |
+| REFUND_EXECUTION_MODE | Disabled by default. Test Mode submission also requires approval for the exact operation. See [refund operator guide](REFUND_SETUP.md). |
 | BRIEFING_TEST_EMAIL | Required to enqueue simulated briefing; no email sender |
 
 ## Boundaries and adapters
@@ -22,7 +23,7 @@ Patient sessions require both clinic and opaque session ID; patient queries scop
 
 `BookingAdapter` exposes getSlots (busy intervals), holdSlot, findOrCreatePatient, confirmBooking, rescheduleBooking, cancelBooking. Lotus calls the stateful HTTP mock. Harbor uses Google Calendar freeBusy and event GET/POST/PATCH/DELETE, with a deterministic event ID. Calendar is not a reservation lock. It does not store phone data in events. The provider wrapper times out after ten seconds and flattens non-success answers into PROVIDER_REJECTED.
 
-Razorpay creates an INR order for the stored hold fee and reads the provider payment before accepting capture. HMAC validates checkout signatures and configured webhook signatures. Webhook does not confirm automatically. Use only Test Mode and confirm against an authorized test calendar. Reconcile late captures as REFUND_PENDING and track provider evidence manually; no refund submission or settlement worker exists.
+Razorpay creates an INR order for the stored hold fee and reads the provider payment before accepting capture. HMAC validates checkout signatures and configured webhook signatures. Webhook does not confirm bookings automatically. Use Test Mode and an authorized test calendar. Late captures enter REFUND_PENDING. The refund worker can submit explicitly approved Test Mode operations and reconciles submitted operations against provider evidence. See [refund setup](REFUND_SETUP.md).
 
 ## Outstanding risks
 

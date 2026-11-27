@@ -1,5 +1,6 @@
 import express,{type Request,type Response,type NextFunction} from 'express';
 import { channels } from './notification-outbox.js';
+import { RefundWorker } from './refund-worker.js';
 import { randomUUID,randomBytes,createHash,scryptSync } from 'node:crypto';
 import { z } from 'zod';
 import * as contracts from '../../../packages/shared/src/index.js';
@@ -16,6 +17,7 @@ export function createApp(db:DB,options:{mockBase?:string;mockKey:string;webhook
  },options.otpSink,options.now);
  const provider=options.provider??new RazorpayProvider(process.env.RAZORPAY_KEY_ID??'',process.env.RAZORPAY_KEY_SECRET??'');
  const payments=new Payments(engine,provider);
+ const refunds=new RefundWorker(db,provider,process.env.REFUND_EXECUTION_MODE==='razorpay-test',engine.now);
  const hash=(s:string)=>createHash('sha256').update(s).digest('hex');
  app.use((req,res,next)=>{res.locals.requestId=randomUUID();res.setHeader('Cache-Control','no-store');res.setHeader('X-Content-Type-Options','nosniff');const origin=req.headers.origin;if(origin){if(!(options.origins??['http://localhost:5173','http://localhost:5174']).includes(origin))return next(new Fault('ORIGIN_NOT_ALLOWED','Origin not allowed',403));res.setHeader('Access-Control-Allow-Origin',origin);res.setHeader('Vary','Origin');res.setHeader('Access-Control-Allow-Headers','Content-Type, Authorization, X-Clinic-Id, X-Session-Id');res.setHeader('Access-Control-Allow-Methods','GET,POST,PATCH,DELETE,OPTIONS');}if(req.method==='OPTIONS'){res.sendStatus(204);return;}next();});
  const limits=new Map<string,{count:number;reset:number}>();app.use((req,res,next)=>{const key=req.socket.remoteAddress??'unknown',now=Date.now();if(limits.size>10000)for(const [k,v] of limits)if(v.reset<now)limits.delete(k);let value=limits.get(key);if(!value||value.reset<now){value={count:0,reset:now+60000};limits.set(key,value);}if(++value.count>120)return next(new Fault('RATE_LIMIT','Try again later',429));next();});
@@ -41,6 +43,9 @@ export function createApp(db:DB,options:{mockBase?:string;mockKey:string;webhook
     const row=engine.one('SELECT p.*,h.session_id FROM payments p JOIN holds h ON h.id=p.hold_id WHERE p.order_id=?',payment.order_id);
     requireThat(row,'PAYMENT_NOT_FOUND');
     await payments.reconcile(row.clinic_id,row.session_id,row.hold_id,row.order_id,payment.id,body.event==='payment.failed');
+   } else if(['refund.created','refund.processed','refund.failed','refund.speed_changed'].includes(body.event)){
+    const payload=z.object({refund:z.object({entity:z.object({id:z.string().min(1),payment_id:z.string().min(1)})})}).parse(body.payload);
+    await refunds.webhook(payload.refund.entity.payment_id,payload.refund.entity.id);
    }
    engine.run('UPDATE payment_webhook_events SET processed_at=? WHERE id=? AND processed_at IS NULL',engine.now(),eventId);
   }
@@ -94,6 +99,12 @@ export function createApp(db:DB,options:{mockBase?:string;mockKey:string;webhook
   LEFT JOIN appointments a ON a.id=o.appointment_id AND a.clinic_id=o.clinic_id
   WHERE o.clinic_id=? ORDER BY j.scheduled_at DESC,j.id LIMIT 200
  `,res.locals.clinic)));
+ app.get('/api/admin/refunds',(_req,res)=>ok(res,engine.all(`
+  SELECT r.id,r.amount,r.currency,r.reason,r.status,r.attempts,r.last_error AS reviewReason,
+   r.created_at AS createdAt,r.completed_at AS completedAt,a.reference AS bookingReference
+  FROM refund_operations r LEFT JOIN appointments a ON a.id=r.appointment_id AND a.clinic_id=r.clinic_id
+  WHERE r.clinic_id=? ORDER BY r.created_at DESC,r.id LIMIT 200
+ `,res.locals.clinic)));
  app.post('/api/admin/appointments/:id/:action',async(req,res)=>{const a=engine.one('SELECT * FROM appointments WHERE id=? AND clinic_id=?',String(req.params.id),res.locals.clinic);requireThat(a,'NOT_FOUND',undefined,404);if(req.params.action==='cancel')ok(res,adminAppointment(await engine.cancel(a.clinic_id,a.session_id,a.id)));else if(req.params.action==='reschedule'){const p=contracts.holdRequest.parse(req.body);const start=new Date(p.start).toISOString();if(a.state==='CONFIRMED'&&a.start===start&&a.doctor_id===p.doctorId&&a.service_id===p.serviceId){ok(res,adminAppointment(a));return;}requireThat(!engine.one('SELECT booking_key FROM booking_operations WHERE booking_key=?',a.hold_id),'RESCHEDULE_PENDING','Booking operation pending reconciliation',503);const h=await engine.reserve(a.clinic_id,a.session_id,p);ok(res,adminAppointment(await engine.reschedule(a.clinic_id,a.session_id,a.id,h.id)));}else throw new Fault('NOT_FOUND','Unknown action',404);});
  app.use('/api',(req,res,next)=>{const clinic=String(req.headers['x-clinic-id']??''),session=String(req.headers['x-session-id']??'');const s=engine.one('SELECT * FROM sessions WHERE id=? AND clinic_id=? AND expires_at>?',session,clinic,engine.now());if(!s)return next(new Fault('SESSION_REQUIRED','Valid clinic session headers required',401));res.locals.clinic=clinic;res.locals.session=session;next();});
  app.post('/api/consent',(req,res)=>{const p=contracts.consentRequest.parse(req.body);engine.run('INSERT INTO consents VALUES(?,?,?,?,?,?)',randomUUID(),res.locals.session,res.locals.clinic,1,Number(p.briefing),engine.now());ok(res,{recorded:true});});
@@ -113,6 +124,16 @@ export function createApp(db:DB,options:{mockBase?:string;mockKey:string;webhook
  app.post('/api/payments/verify',async(req,res)=>ok(res,await payments.verify(res.locals.clinic,res.locals.session,contracts.paymentVerifyRequest.parse(req.body))));
  app.post('/api/bookings/confirm',async(req,res)=>ok(res,await engine.confirm(res.locals.clinic,res.locals.session,contracts.holdIdRequest.parse(req.body).holdId)));
  app.get('/api/holds/:id',(req,res)=>ok(res,engine.hold(res.locals.clinic,res.locals.session,String(req.params.id),false)));
+ app.get('/api/holds/:id/refund',(req,res)=>{
+  const hold=engine.hold(res.locals.clinic,res.locals.session,String(req.params.id),false);
+  const refund=engine.one(`SELECT r.status,r.amount,r.currency,r.completed_at AS completedAt
+   FROM refund_operations r JOIN payments p ON p.id=r.payment_ref AND p.clinic_id=r.clinic_id
+   WHERE p.clinic_id=? AND p.hold_id=?`,hold.clinic_id,hold.id);
+  const payment=engine.one('SELECT state,currency,amount FROM payments WHERE clinic_id=? AND hold_id=?',hold.clinic_id,hold.id);
+  ok(res,refund??(payment?.state==='REFUND_PENDING'?
+   {status:'MANUAL',amount:payment.amount,currency:payment.currency,completedAt:null}:
+   {status:'NOT_APPLICABLE',amount:null,currency:null,completedAt:null}));
+ });
  app.get('/api/bookings/:id',(req,res)=>ok(res,engine.booking(res.locals.clinic,res.locals.session,String(req.params.id))));
  app.post('/api/bookings/:id/cancel',async(req,res)=>ok(res,await engine.cancel(res.locals.clinic,res.locals.session,String(req.params.id))));
  app.post('/api/bookings/:id/reschedule',async(req,res)=>ok(res,await engine.reschedule(res.locals.clinic,res.locals.session,String(req.params.id),contracts.holdIdRequest.parse(req.body).holdId)));
@@ -133,5 +154,5 @@ export function createApp(db:DB,options:{mockBase?:string;mockKey:string;webhook
  app.delete('/mock/:clinic/bookings/:id',(req,res)=>{requireThat(engine.one('SELECT id FROM mock_bookings WHERE id=? AND clinic_id=?',String(req.params.id),String(req.params.clinic)),'MOCK_NOT_FOUND',undefined,404);engine.run("UPDATE mock_bookings SET state='CANCELLED' WHERE id=?",String(req.params.id));res.json({cancelled:true});});
  app.use((_req,_res,next)=>next(new Fault('NOT_FOUND','Endpoint not found',404)));
  app.use((err:unknown,_req:Request,res:Response,_next:NextFunction)=>{const validation=err instanceof z.ZodError;const fault=err instanceof Fault;res.status(validation?400:fault?err.status:500).json({ok:false,error:{code:validation?'VALIDATION_ERROR':fault?err.code:'INTERNAL_ERROR',message:validation?'Invalid request':fault?err.message:'Request could not be completed'},requestId:res.locals.requestId});});
- return {app,engine,payments,provider};
+ return {app,engine,payments,provider,refunds};
 }
