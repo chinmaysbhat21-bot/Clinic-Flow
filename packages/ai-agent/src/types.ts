@@ -71,6 +71,12 @@ export interface ToolContext {
   sessionId: string;
 }
 
+export interface IntentExtractionContext extends Pick<AgentState, "intent" | "serviceName" | "doctorName" | "preferredDate" | "timePreference"> {
+  /** Verified clinic catalog names; used only to resolve multilingual follow-up selections. */
+  doctorOptions?: string[];
+  serviceOptions?: string[];
+}
+
 export interface Doctor {
   id: string;
   name: string;
@@ -110,7 +116,7 @@ export interface AgentTools {
 }
 
 export interface IntentExtractor {
-  extract(message: string, language: Language, currentDate: string, context?: Pick<AgentState, "intent" | "serviceName" | "doctorName" | "preferredDate" | "timePreference">): Promise<ExtractedIntent>;
+  extract(message: string, language: Language, currentDate: string, context?: IntentExtractionContext): Promise<ExtractedIntent>;
   translateFaq?(answer: string, language: Language): Promise<string>;
 }
 

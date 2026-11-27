@@ -68,19 +68,23 @@ export function createAgent(tools: AgentTools, extractor: IntentExtractor, confi
           timeZone: config.timezone ?? "Asia/Kolkata",
           year: "numeric", month: "2-digit", day: "2-digit",
         }).format(now());
-        extracted = await extractor.extract(request.message, language, currentDate, {
+        const extractionContext = {
           intent: state.intent,
           serviceName: state.serviceName,
           doctorName: state.doctorName,
           preferredDate: state.preferredDate,
           timePreference: state.timePreference,
-        });
+          ...(previous.intent === "book_appointment" || previous.intent === "availability"
+            ? await verifiedCatalogNames(tools, context, !state.doctorId, !state.serviceId)
+            : {}),
+        };
+        extracted = await extractor.extract(request.message, language, currentDate, extractionContext);
       } catch {
         const actions = state.userMessageCount >= 2 ? await handoffAction(tools, context) : [];
         return response(state.userMessageCount >= 2 ? text(language, "toolFailure") : text(language, "needMore"), language, state, actions);
       }
 
-      const followUpIntent = previous.intent === "book_appointment" && (extracted.intent === "other" || extracted.intent === "search_services" || extracted.intent === "search_doctors");
+      const followUpIntent = (previous.intent === "book_appointment" || previous.intent === "availability") && (extracted.intent === "other" || extracted.intent === "search_services" || extracted.intent === "search_doctors");
       state.intent = followUpIntent ? previous.intent : extracted.intent;
       const attachBriefingCandidate = (reply: ChatResponse): ChatResponse => {
         const concern = extracted.intent === "medical_advice" ? null : extracted.patientReportedConcern?.trim().slice(0, 2000);
@@ -118,6 +122,17 @@ export function createAgent(tools: AgentTools, extractor: IntentExtractor, confi
       return attachBriefingCandidate(response(text(language, "generic"), language, state));
     },
   };
+}
+
+async function verifiedCatalogNames(tools: AgentTools, context: ToolContext, includeDoctors: boolean, includeServices: boolean): Promise<{ doctorOptions?: string[]; serviceOptions?: string[] }> {
+  const [doctorResult, serviceResult] = await Promise.all([
+    includeDoctors ? callTool(tools, "getDoctors", {}, context).catch(() => null) : Promise.resolve(null),
+    includeServices ? callTool(tools, "getServices", {}, context).catch(() => null) : Promise.resolve(null),
+  ]);
+  const result: { doctorOptions?: string[]; serviceOptions?: string[] } = {};
+  if (doctorResult !== null) result.doctorOptions = z.array(DoctorSchema).parse(doctorResult).map((doctor) => doctor.name).slice(0, 50);
+  if (serviceResult !== null) result.serviceOptions = z.array(ServiceSchema).parse(serviceResult).map((service) => service.name).slice(0, 50);
+  return result;
 }
 
 async function bookOrFindSlots(
