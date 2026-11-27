@@ -6,6 +6,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { reconcileOffline } from '../../apps/api/src/recovery.js';
+import { renderNotification } from '../../apps/api/src/notification-templates.js';
 import { configureBrevo } from '../../apps/api/src/brevo-notifications.js';
 import { configureOtpDelivery } from '../../apps/api/src/otp-delivery.js';
 import { Payments } from '../../apps/api/src/payments.js';
@@ -1039,4 +1040,86 @@ test('Brevo migration preserves existing preferences and restricts dispatch to t
    assert.equal(calls,0);
   }finally{await migrated.close();}
  }finally{rmSync(dir,{recursive:true});}
+});
+
+test('static notification templates cover all events, preserve Unicode and fall back to English',()=>{
+ const events=['CONFIRMATION','CANCELLATION','RESCHEDULE','REMINDER','PAYMENT_CONFIRMED',
+  'REFUND_PENDING','REFUND_COMPLETED','REFUND_REVIEW','BRIEFING'] as const;
+ for(const event of events){
+  const context={event,timezone:'Asia/Kolkata',start:'2026-12-01T03:30:00.000Z',
+   clinic:'Harbor Clinic Test',doctor:'Demo Doctor',reference:'AH-DeMo-001',amountPaise:12345678};
+  const english=renderNotification({...context,language:'en'})!;
+  assert.deepEqual(renderNotification({...context,language:'unsupported'}),english);
+  for(const [language,script] of [['en',/[A-Za-z]/],['kn',/\p{Script=Kannada}/u],['hi',/\p{Script=Devanagari}/u]] as const){
+   const message=renderNotification({...context,language})!;
+   assert.equal(message.language,language);
+   assert.match(message.subject,script);
+   assert.match(message.text.split('\n')[0],script);
+   const hasTime=['CONFIRMATION','RESCHEDULE','REMINDER'].includes(event);
+   const hasAmount=['PAYMENT_CONFIRMED','REFUND_COMPLETED'].includes(event);
+   assert.equal(message.text.includes('Asia/Kolkata'),hasTime);
+   if(hasTime)assert.match(message.text,/9:00/);
+   assert.equal(message.text.includes('₹1,23,456.78'),hasAmount);
+   for(const value of [context.reference,context.clinic,context.doctor]){
+    assert.equal(message.text.includes(value),event!=='BRIEFING');
+   }
+  }
+ }
+});
+
+test('saved Kannada and Hindi preferences reach Brevo as localized subjects and Unicode bodies',async()=>{
+ for(const [language,script] of [['kn',/\p{Script=Kannada}/u],['hi',/\p{Script=Devanagari}/u]] as const){
+  const f=await fixture();
+  try{
+   const hold=await f.verifiedHold();
+   const preference=await f.request('/api/notification-preferences','POST',{...emailPreference,language},f.session);
+   assert.equal(preference.data.language,language);
+   await (await f.pay(hold.id)).verify();
+   const booking=await f.engine.confirm('lotus',f.session,hold.id);
+   f.engine.briefing('lotus',f.session,booking.id,'Private medical summary','private@example.invalid');
+   const bodies:Array<{subject:string;textContent:string}>=[];
+   const provider=configureBrevo('development',brevoTestConfig,async(_url,init)=>{
+    bodies.push(JSON.parse(String(init?.body)));
+    return Response.json({messageId:'fixture-only'},{status:201});
+   });
+   const worker=new NotificationWorker(f.db,provider,{},f.engine.now);
+   while(await worker.runOnce()){}
+   assert.equal(bodies.length,2);
+   for(const body of bodies){
+    assert.match(body.subject,script);
+    assert.match(body.textContent,script);
+    for(const privateValue of ['Private medical summary','private@example.invalid',f.session,'+919999999999']){
+     assert.equal(body.textContent.includes(privateValue),false);
+    }
+   }
+   assert.ok(bodies.some(body=>body.textContent.includes(booking.reference)&&body.textContent.includes('Asia/Kolkata')));
+   assert.ok(bodies.some(body=>body.textContent.includes('₹500.00')));
+   assert.equal(f.engine.one("SELECT status FROM notification_jobs WHERE event='BRIEFING'")?.status,'MANUAL');
+  }finally{await f.close();}
+ }
+});
+
+test('a missing notification template enters manual review without spending quota or affecting the booking',async()=>{
+ const f=await fixture();
+ try{
+  const hold=await f.verifiedHold();
+  await f.request('/api/notification-preferences','POST',emailPreference,f.session);
+  await (await f.pay(hold.id)).verify();
+  const booking=await f.engine.confirm('lotus',f.session,hold.id);
+  f.engine.run("UPDATE notification_jobs SET event='UNKNOWN_FIXTURE_EVENT',next_at=? WHERE event='CONFIRMATION'",f.engine.now()-1);
+  let calls=0;
+  const provider=configureBrevo('development',brevoTestConfig,async()=>{
+   calls++;
+   return Response.json({messageId:'fixture-only'},{status:201});
+  });
+  const worker=new NotificationWorker(f.db,provider,{},f.engine.now);
+  assert.equal(await worker.runOnce(),true);
+  const job=f.engine.one("SELECT status,last_error,attempts FROM notification_jobs WHERE event='UNKNOWN_FIXTURE_EVENT'");
+  assert.equal(job?.status,'MANUAL');
+  assert.equal(job?.last_error,'RENDER_FAILED');
+  assert.equal(job?.attempts,0);
+  assert.equal(f.engine.one('SELECT count(*) AS n FROM email_submission_budget')?.n,0);
+  assert.equal(calls,0);
+  assert.equal(f.engine.booking('lotus',f.session,booking.id).state,'CONFIRMED');
+ }finally{await f.close();}
 });

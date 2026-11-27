@@ -36,7 +36,7 @@ export function configureBrevo(environment: string | undefined, env: NodeJS.Proc
     body: JSON.stringify({
      sender: { email: sender.data, name },
      to: [{ email: recipient.data }],
-     subject: 'Clinic Flow update',
+     subject: message.subject,
      textContent: message.text,
     }),
    });
