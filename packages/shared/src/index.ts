@@ -1,6 +1,8 @@
 import { z } from 'zod';
 export const BookingStatus = z.enum(['AVAILABLE','HELD','OTP_VERIFIED','PAYMENT_PENDING','PAYMENT_VERIFIED','CONFIRMATION_PENDING','CONFIRMED','EXPIRED','CANCELLED','PAYMENT_FAILED','REFUND_PENDING','REFUNDED']);
 export const PaymentStatus = z.enum(['CREATED','VERIFIED','FAILED','REFUND_PENDING','REFUNDED']);
+export const AdminRole = z.enum(['OWNER','MANAGER','STAFF']);
+export type AdminRoleType = z.infer<typeof AdminRole>;
 export const language = z.enum(['en','kn','hi']);
 export const slotQuery = z.object({doctorId:z.string().min(1),serviceId:z.string().min(1),date:z.iso.date()});
 export const holdRequest = slotQuery.omit({date:true}).extend({start:z.iso.datetime()});
@@ -17,9 +19,17 @@ export const ChatAction = z.discriminatedUnion('type',[
  z.object({type:z.literal('CONFIRMED'),bookingId:z.string(),reference:z.string()}),
  z.object({type:z.literal('HANDOFF'),contact:z.string()})]);
 export type BookingState=z.infer<typeof BookingStatus>;
+export const adminAppointmentDetail=z.object({
+ id:z.string(),reference:z.string(),doctor_id:z.string(),service_id:z.string(),
+ start:z.iso.datetime(),end:z.iso.datetime(),state:BookingStatus,
+ fee:z.number().int().nullable(),duration:z.number().int().nullable(),
+});
+export type AdminAppointmentDetail=z.infer<typeof adminAppointmentDetail>;
 export type ApiResponse<T>={ok:true;data:T;requestId:string}|{ok:false;error:{code:string;message:string};requestId:string};
 export type Slot={start:string;end:string};
 export interface BookingAdapter {
+ lookupBooking?(id:string):Promise<{id:string;doctorId:string;start:string;end:string;state:string}|null>;
+ confirmationLookupId?(holdId:string):string;
  getSlots(input:{doctorId:string;start:string;end:string}):Promise<Slot[]>;
  holdSlot(input:{id:string;doctorId:string;start:string;end:string;expiresAt:string}):Promise<string>;
  findOrCreatePatient(input:{id:string;phone:string}):Promise<string>;

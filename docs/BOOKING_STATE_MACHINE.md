@@ -2,6 +2,12 @@
 
 The combined shared BookingStatus enum contains AVAILABLE, HELD, OTP_VERIFIED, PAYMENT_PENDING, PAYMENT_VERIFIED, CONFIRMATION_PENDING, CONFIRMED, EXPIRED, CANCELLED, PAYMENT_FAILED, REFUND_PENDING and REFUNDED. PaymentStatus contains CREATED, VERIFIED, FAILED, REFUND_PENDING and REFUNDED. Enum membership does not imply a reachable stored state.
 
+Reconciliation jobs have internal PENDING, RUNNING, DONE and MANUAL states. A lease expiry permits another worker to retry a provider lookup. Applying verified evidence uses the existing booking or payment transition. A pending reschedule guard quarantines the replacement slot after its hold expires and until authoritative evidence resolves the operation. The worker does not release reservations on retry exhaustion.
+
+Verified booking and payment transitions enqueue durable notification jobs in the same transaction. The worker rechecks consent and state before dispatch. Moving or cancelling a booking invalidates the old reminder schedule. Notification states are separate from booking and payment states. See [notification setup](NOTIFICATION_SETUP.md).
+
+An eligible cancellation, expired capture or definitively failed booking creates a durable refund operation while the payment is REFUND_PENDING. The operation progresses through PENDING, PROCESSING, then COMPLETED or MANUAL. Only matching processed provider evidence and the full refunded amount can move payment and a corresponding pending appointment to REFUNDED. See [refund setup](REFUND_SETUP.md).
+
 ```mermaid
 stateDiagram-v2
   [*] --> AVAILABLE

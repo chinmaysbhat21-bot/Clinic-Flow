@@ -14,15 +14,17 @@ Base URL is `http://127.0.0.1:4000`. Send `Content-Type: application/json` for J
 | `GET /api/clinics/{id}/doctors` | public | IMPLEMENTED BUT UNVERIFIED |
 | `GET /api/clinics/{id}/services` | public | IMPLEMENTED BUT UNVERIFIED |
 | `POST /api/consent` | patient | IMPLEMENTED AND VERIFIED |
+| `POST /api/notification-preferences` | patient | IMPLEMENTED AND VERIFIED. Save `en`, `kn` or `hi` for notification rendering. English is the default and the fallback for unsupported stored values. |
 | `GET /api/slots` | patient | IMPLEMENTED AND VERIFIED |
 | `POST /api/holds` | patient | IMPLEMENTED AND VERIFIED |
 | `GET /api/holds/{id}` | patient | IMPLEMENTED BUT UNVERIFIED |
+| `GET /api/holds/{id}/refund` | patient | IMPLEMENTED AND VERIFIED |
 | `DELETE /api/holds/{id}` | patient | IMPLEMENTED BUT UNVERIFIED |
 | `POST /api/otp/send` | patient | PARTIALLY IMPLEMENTED |
 | `POST /api/otp/verify` | patient | IMPLEMENTED AND VERIFIED |
 | `POST /api/payments/order` | patient | PARTIALLY IMPLEMENTED |
 | `POST /api/payments/verify` | patient | BLOCKED |
-| `POST /api/payments/webhook` | webhook | BLOCKED |
+| `POST /api/payments/webhook` | webhook | HTTP 200 means durable receipt; provider reconciliation runs in the background. HTTP 503 requests redelivery after storage or mapping failure. [External Test Mode delivery pending](RAZORPAY_WEBHOOK_SETUP.md). |
 | `POST /api/bookings/confirm` | patient | BLOCKED |
 | `GET /api/bookings/{id}` | patient | BLOCKED |
 | `POST /api/bookings/{id}/cancel` | patient | BLOCKED |
@@ -33,6 +35,8 @@ Base URL is `http://127.0.0.1:4000`. Send `Content-Type: application/json` for J
 | `POST /api/admin/login` | public | IMPLEMENTED AND VERIFIED |
 | `GET /api/admin/appointments` | admin | IMPLEMENTED AND VERIFIED |
 | `GET /api/admin/overview` | admin | IMPLEMENTED BUT UNVERIFIED |
+| `GET /api/admin/reconciliation` | admin | Includes clinic-scoped `WEBHOOK` jobs. An authorized administrator can requeue a manual webhook job; its outcome requires worker evidence. |
+| `GET /api/admin/notifications` | admin | IMPLEMENTED AND VERIFIED. `ACCEPTED` indicates provider acceptance. Rendering failures appear as `MANUAL` with reason `RENDER_FAILED`. |
 | `GET /api/admin/config` | admin | IMPLEMENTED BUT UNVERIFIED |
 | `PATCH /api/admin/config` | admin | IMPLEMENTED BUT UNVERIFIED |
 | `GET /api/admin/doctors` | admin | IMPLEMENTED BUT UNVERIFIED |
@@ -45,6 +49,7 @@ Base URL is `http://127.0.0.1:4000`. Send `Content-Type: application/json` for J
 | `POST /api/admin/blocks` | admin | IMPLEMENTED BUT UNVERIFIED |
 | `GET /api/admin/blocks` | admin | IMPLEMENTED BUT UNVERIFIED |
 | `GET /api/admin/payments` | admin | IMPLEMENTED BUT UNVERIFIED |
+| `GET /api/admin/refunds` | admin | IMPLEMENTED AND VERIFIED |
 | `GET /api/admin/audit-logs` | admin | IMPLEMENTED BUT UNVERIFIED |
 | `GET /api/admin/outbox` | admin | IMPLEMENTED BUT UNVERIFIED |
 | `POST /api/admin/appointments/{id}/{action}` | admin | BLOCKED |
@@ -52,6 +57,7 @@ Base URL is `http://127.0.0.1:4000`. Send `Content-Type: application/json` for J
 | `POST /mock/{clinic}/holds` | mock | IMPLEMENTED AND VERIFIED |
 | `POST /mock/{clinic}/patients` | mock | IMPLEMENTED AND VERIFIED |
 | `POST /mock/{clinic}/bookings/{id}/confirm` | mock | IMPLEMENTED AND VERIFIED |
+| `GET /mock/{clinic}/bookings/{id}` | mock | IMPLEMENTED AND VERIFIED |
 | `PATCH /mock/{clinic}/bookings/{id}` | mock | IMPLEMENTED AND VERIFIED |
 | `DELETE /mock/{clinic}/bookings/{id}` | mock | IMPLEMENTED AND VERIFIED |
 
@@ -66,7 +72,7 @@ Base URL is `http://127.0.0.1:4000`. Send `Content-Type: application/json` for J
 | Consent, OTPVerification | Shared request validators. Consent accepts literal booking=true and optional briefing flag. OTP accepts international phone and six-digit string. Never serialize OTP records. |
 | AvailabilitySlot, SlotHold | Shared `Slot` and hold request. Hold response projection uses id, start, end, fee in paise, expires_at in milliseconds, state. |
 | PaymentOrder, PaymentStatus | Inline checkout response with keyId, orderId, amount and INR. Shared PaymentStatus enum. Verification response mixes booking and payment states. |
-| Appointment, AppointmentStatus, RefundStatus | Shared BookingStatus combines multiple lifecycle concepts. No independent runtime refund status schema. Project appointment fields explicitly. |
+| Appointment, AppointmentStatus, RefundStatus | Shared BookingStatus combines several lifecycle concepts. The separate [refund status contract](REFUND_SETUP.md) reports the durable refund operation without exposing provider identifiers. |
 | ChatRequest, ChatResponse | `{message,language}` input and `{message,language,actions}` output, implemented in [AI tool contract](AI_TOOL_CONTRACT.md). Agent state stays server-side. |
 | ChatAction | Existing shared five-way discriminated union; chat route validates every emitted action against it. |
 | ToolRequest, ToolResponse | Existing name-to-Zod argument map and trusted context. No uniform result validator. |
@@ -79,7 +85,7 @@ Base URL is `http://127.0.0.1:4000`. Send `Content-Type: application/json` for J
 
 ## Proposed or missing capabilities
 
-No standalone readiness endpoint, session refresh/revoke, admin appointment details, refund execution or reconciliation endpoint, delivery-status workflow, or separate OTP resend endpoint exists. Resend uses the existing OTP send route. For admin details, a proposed `GET /api/admin/appointments/{id}` would return a clinic-scoped appointment projection or 404. A proposed readiness probe would report dependency readiness separately from liveness. Refund reconciliation should begin as a backend operation with provider confirmation and audit events. Conversation state for `/api/chat` currently lives in a bounded in-memory map scoped to clinic and session. It expires after 24 hours and is lost on restart; multi-process deployment needs shared persistence. Gemini configuration is server-side through `LLM_PROVIDER=gemini`, `GEMINI_API_KEY`, and optional `GEMINI_MODEL`.
+No standalone readiness endpoint, session refresh/revoke, admin appointment details, public refund submission, delivery-status workflow, or separate OTP resend endpoint exists. Resend uses the existing OTP send route. For admin details, a proposed `GET /api/admin/appointments/{id}` would return a clinic-scoped appointment projection or 404. A proposed readiness probe would report dependency readiness separately from liveness. Refund reconciliation runs as a backend operation with provider confirmation and audit events. Conversation state for `/api/chat` currently lives in a bounded in-memory map scoped to clinic and session. It expires after 24 hours and is lost on restart; multi-process deployment needs shared persistence. Gemini configuration is server-side through `LLM_PROVIDER=gemini`, `GEMINI_API_KEY`, and optional `GEMINI_MODEL`. Chat contract proposals do not change the current OpenAPI paths.
 
 ## Versioning
 
