@@ -4,9 +4,12 @@ import { createApp } from './server.js';
 import { configureOtpDelivery } from './otp-delivery.js';
 import { ReconciliationWorker } from './reconciliation.js';
 import { configureNotificationDelivery,NotificationWorker } from './notification-worker.js';
+import { configureBrevo } from './brevo-notifications.js';
 import { reminderMinutes } from './notification-outbox.js';
 const otpDelivery=configureOtpDelivery(process.env.NODE_ENV,process.env.OTP_MODE);
-const notificationProvider=configureNotificationDelivery(process.env.NODE_ENV,process.env.NOTIFICATION_MODE);
+const notificationProvider=process.env.NOTIFICATION_MODE==='brevo'
+ ? configureBrevo(process.env.NODE_ENV,process.env)
+ : configureNotificationDelivery(process.env.NODE_ENV,process.env.NOTIFICATION_MODE);
 if(!['disabled','razorpay-test'].includes(process.env.REFUND_EXECUTION_MODE??'disabled'))throw new Error('Invalid REFUND_EXECUTION_MODE');
 const notificationPollMs=Number(process.env.NOTIFICATION_POLL_MS??5000);
 if(!Number.isSafeInteger(notificationPollMs)||notificationPollMs<1000||notificationPollMs>60000)throw new Error('NOTIFICATION_POLL_MS must be between 1000 and 60000');

@@ -1103,6 +1103,7 @@
     "/api/notification-preferences": {
       "post": {
         "summary": "Set communication opt-in for the authenticated patient session",
+        "description": "For the Brevo demo, opt in with EMAIL and the operator-approved demo inbox. The email address is write-only and is omitted from the response. Requests without an email keep their existing shape and do not authorize Brevo delivery.",
         "security": [
           {
             "ClinicId": [],
@@ -1231,6 +1232,13 @@
                     ],
                     "default": "CONSOLE"
                   },
+                  "email": {
+                    "type": "string",
+                    "format": "email",
+                    "maxLength": 254,
+                    "writeOnly": true,
+                    "example": "demo-inbox@example.invalid"
+                  },
                   "language": {
                     "enum": [
                       "en",
@@ -1253,6 +1261,7 @@
     "/api/admin/notifications": {
       "get": {
         "summary": "List clinic notification statuses",
+        "description": "ACCEPTED means Brevo accepted the submission. Inbox delivery requires separate verification. SIMULATED means a local console record was produced.",
         "security": [
           {
             "AdminBearer": []
@@ -1310,6 +1319,7 @@
                               "PENDING",
                               "RUNNING",
                               "SIMULATED",
+                              "ACCEPTED",
                               "DELIVERED",
                               "SUPPRESSED",
                               "MANUAL"
