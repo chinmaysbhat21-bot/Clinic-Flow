@@ -3282,8 +3282,8 @@
     "/api/admin/appointments": {
       "get": {
         "summary": "Clinic list ordered by start, capped at 200",
-        "description": "Clinic list ordered by start, capped at 200. Search is reference substring via SQL LIKE. Current raw response leaks the patient session credential.",
-        "x-implementation-status": "BLOCKED",
+        "description": "Clinic list ordered by start, capped at 200. Search is reference substring via SQL LIKE. Returns only the documented dashboard fields.",
+        "x-implementation-status": "IMPLEMENTED AND VERIFIED",
         "x-owner": "Chinmay",
         "x-source": "apps/api/src/server.ts:createApp",
         "security": [
@@ -5711,7 +5711,7 @@
     "/api/admin/appointments/{id}/{action}": {
       "post": {
         "summary": "Action cancel ignores body; reschedule requires a HoldRequest",
-        "description": "Action cancel ignores body; reschedule requires a HoldRequest. Raw result exposes patient session credential. Reschedule creates a new hold per call.",
+        "description": "Action cancel ignores body; reschedule requires a HoldRequest. Returns only dashboard fields. Concurrent mutations remain unsafe. Reschedule creates a new hold per call.",
         "x-implementation-status": "BLOCKED",
         "x-owner": "Chinmay",
         "x-source": "apps/api/src/server.ts:createApp",
