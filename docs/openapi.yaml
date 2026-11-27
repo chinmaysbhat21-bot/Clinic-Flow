@@ -1465,6 +1465,7 @@
                             "enum": [
                               "ORDER",
                               "CAPTURE",
+                              "WEBHOOK",
                               "REFUND",
                               "CONFIRM",
                               "CANCEL",
@@ -3654,8 +3655,8 @@
     "/api/payments/webhook": {
       "post": {
         "summary": "Reconcile signed payment and refund events",
-        "description": "Verifies raw bytes and deduplicates by event ID or body digest. Captured and failed payment events invoke payment reconciliation. refund.created, refund.processed, refund.failed and refund.speed_changed trigger authoritative refund lookup for an existing submitted operation. No automatic booking confirmation.",
-        "x-implementation-status": "BLOCKED",
+        "description": "Verifies uncompressed raw JSON bytes up to 64 KiB using the dedicated webhook secret. Deduplicates by event ID or body digest. payment.captured, payment.failed and order.paid invoke authoritative payment reconciliation. order.paid requires a matching order entity. HTTP 200 acknowledges a committed receipt and, for a supported event, its background reconciliation job. Provider evidence is evaluated outside the HTTP request. External Test Mode delivery remains unverified. refund.created, refund.processed, refund.failed and refund.speed_changed trigger authoritative refund lookup for an existing submitted operation. No automatic booking confirmation.",
+        "x-implementation-status": "LOCALLY VERIFIED",
         "x-owner": "Chinmay",
         "x-source": "apps/api/src/server.ts:createApp",
         "security": [
@@ -3665,7 +3666,7 @@
         ],
         "responses": {
           "200": {
-            "description": "Success",
+            "description": "Durably accepted. Processing can still be pending.",
             "content": {
               "application/json": {
                 "schema": {
@@ -3706,7 +3707,7 @@
             }
           },
           "400": {
-            "description": "INVALID_WEBHOOK_SIGNATURE, INVALID_WEBHOOK, PAYMENT_NOT_FOUND, PAYMENT_MISMATCH, PAYMENT_NOT_CAPTURED, VALIDATION_ERROR",
+            "description": "INVALID_WEBHOOK_SIGNATURE, INVALID_WEBHOOK, VALIDATION_ERROR",
             "content": {
               "application/json": {
                 "schema": {
@@ -3725,6 +3726,8 @@
               }
             }
           },
+          "413": { "description": "WEBHOOK_BODY_TOO_LARGE" },
+          "415": { "description": "WEBHOOK_ENCODING_UNSUPPORTED" },
           "429": {
             "description": "RATE_LIMIT",
             "content": {
@@ -3745,18 +3748,8 @@
               }
             }
           },
-          "502": {
-            "description": "PROVIDER_REJECTED",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Error"
-                }
-              }
-            }
-          },
           "503": {
-            "description": "WEBHOOK_NOT_CONFIGURED, RAZORPAY_NOT_CONFIGURED, PROVIDER_UNAVAILABLE",
+            "description": "WEBHOOK_NOT_CONFIGURED, WEBHOOK_PAYMENT_UNMAPPED, WEBHOOK_PERSISTENCE_UNAVAILABLE",
             "content": {
               "application/json": {
                 "schema": {
@@ -3779,6 +3772,12 @@
                   "payload": {
                     "type": "object",
                     "properties": {
+                      "order": {
+                        "description": "Required for order.paid and must match payment.entity.order_id.",
+                        "type": "object",
+                        "properties": { "entity": { "type": "object", "properties": { "id": { "type": "string" } }, "required": ["id"] } },
+                        "required": ["entity"]
+                      },
                       "payment": {
                         "type": "object",
                         "properties": {

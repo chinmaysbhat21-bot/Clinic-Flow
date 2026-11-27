@@ -144,17 +144,20 @@ export class RefundWorker {
   return true;
  }
 
- async webhook(paymentId:string,refundId:string){
+ async webhook(paymentId:string,refundId:string,guard?:()=>boolean):Promise<Result>{
   const row=this.db.prepare(selectOperation+" WHERE p.payment_id=? AND r.submitted_at IS NOT NULL").get(paymentId) as Operation|undefined;
-  if(!row||row.status==='COMPLETED'||!this.provider.refund)return;
+  if(!row||!this.provider.refund)return 'MANUAL';
+  if(row.status==='COMPLETED')return 'DONE';
   const refund=await this.provider.refund(refundId);
-  if(refund.id!==refundId||!this.refundMatches(row,refund))return;
+  if(refund.id!==refundId||!this.refundMatches(row,refund))return 'MANUAL';
   const payment=await this.provider.payment(paymentId);
-  const result=this.apply(row,refund,payment);
+  const result=this.apply(row,refund,payment,guard);
   if(result==='MANUAL')transaction(this.db,()=>{
+   if(guard&&!guard())return;
    const change=this.db.prepare(`UPDATE refund_operations SET status='MANUAL',last_error='PROVIDER_OR_ELIGIBILITY_REVIEW',
     lease_token=NULL,lease_until=NULL WHERE id=? AND status<>'COMPLETED'`).run(row.id);
    if(change.changes)enqueuePaymentNotice(this.db,row.hold_id,'REFUND_REVIEW',this.now());
   });
+  return result;
  }
 }

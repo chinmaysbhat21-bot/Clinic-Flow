@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -130,10 +130,9 @@ test('expiry wins before confirmation on a second connection for verified and de
  } finally {rmSync(directory,{recursive:true});}
 });
 
-async function fixture(path = ':memory:'){
+async function fixture(path = ':memory:', webhookSecret='fixture-webhook-secret'){
  const db=openDb(path);seed(db,'test-password-123');let now=Date.parse('2026-12-01T00:00:00Z');const codes=new Map<string,string>();const orders=new Map<string,number>();const captured=new Map<string,{order:string;amount:number}>();
  const provider:PaymentProvider={keyId:'rzp_test_fixture',secret:'fixture-secret',async order(amount){const id=randomUUID();orders.set(id,amount);return {id,amount,currency:'INR'};},async payment(id){const p=captured.get(id)!;return {id,order_id:p.order,amount:p.amount,currency:'INR',status:'captured'};}};
- const webhookSecret='fixture-webhook-secret';
  const state=createApp(db,{mockKey:'fixture-only-key',webhookSecret,provider,now:()=>now,otpSink:(id,code)=>codes.set(id,code)});
  const server=state.app.listen(0,'127.0.0.1');await once(server,'listening');const addr=server.address() as {port:number};const base=`http://127.0.0.1:${addr.port}`;
  // Redirect mock adapter to this ephemeral HTTP server.
@@ -150,7 +149,7 @@ async function fixture(path = ':memory:'){
   const body=JSON.stringify({event,payload});
   return fetch(base+'/api/payments/webhook',{method:'POST',headers:{'Content-Type':'application/json','X-Razorpay-Event-Id':eventId,'X-Razorpay-Signature':valid?signature(webhookSecret,body):'invalid'},body});
  }
- return {...state,provider,db,request,webhook,session,codes,input,consent,reserve,verifiedHold,pay,advance:(ms:number)=>{now+=ms;},close:async()=>{server.closeAllConnections();await new Promise<void>(r=>server.close(()=>r()));db.close();}};
+ return {...state,provider,db,request,webhook,base,session,codes,input,consent,reserve,verifiedHold,pay,advance:(ms:number)=>{now+=ms;},close:async()=>{server.closeAllConnections();await new Promise<void>(r=>server.close(()=>r()));db.close();}};
 }
 
 test('admin filters, fee updates, logout and clinic scoping preserve booking data',async()=>{
@@ -299,25 +298,31 @@ test('signed webhook retries, failed events and concurrent capture share payment
   const hold=await f.verifiedHold();
   const payment=await f.pay(hold.id);
   const {razorpay_payment_id:id,razorpay_order_id:order}=payment.body;
+  const worker=webhookWorker(f);
   const lookup=f.provider.payment.bind(f.provider);
   f.provider.payment=async ()=>({...await lookup(id),id:'failed-attempt',status:'failed'});
   assert.equal((await f.webhook('bad','payment.failed','failed-attempt',order,false)).status,400);
   assert.equal((await f.webhook('failed','payment.failed','failed-attempt',order)).status,200);
+  assert.equal(await worker.runOnce(),true);
   assert.equal(f.engine.one('SELECT state FROM payments WHERE hold_id=?',hold.id)?.state,'FAILED');
   f.provider.payment=async id=>({...await lookup(id),currency:'USD'});
-  assert.equal((await f.webhook('captured','payment.captured',id,order)).status,400);
+  assert.equal((await f.webhook('captured','payment.captured',id,order)).status,200);
+  assert.equal(await worker.runOnce(),true);
+  assert.equal(f.engine.one("SELECT status FROM reconciliation_jobs WHERE operation_ref='captured'")?.status,'PENDING');
+  f.advance(1);
   f.provider.payment=async id=>({...await lookup(id),amount:1});
   assert.equal((await payment.verify()).error.code,'PAYMENT_NOT_CAPTURED');
   const entered=signal(),release=signal();
   let calls=0;
   f.provider.payment=async id=>{if(++calls===1){entered.resolve();await release.promise;}return lookup(id);};
-  const webhook=f.webhook('captured','payment.captured',id,order);
+  const webhook=worker.runOnce();
   await entered.promise;
   try {assert.equal((await payment.verify()).data.state,'PAYMENT_VERIFIED');}
   finally {release.resolve();}
-  assert.equal((await webhook).status,200);
+  assert.equal(await webhook,true);
   assert.equal((await f.webhook('captured','payment.captured',id,order)).status,200);
   assert.equal((await f.webhook('late-failure','payment.failed','failed-attempt',order)).status,200);
+  assert.equal(await worker.runOnce(),true);
   assert.equal(calls,2);
   assert.equal(f.engine.one('SELECT state FROM payments WHERE hold_id=?',hold.id)?.state,'VERIFIED');
   assert.equal(f.engine.all("SELECT id FROM audit WHERE action='PAYMENT_VERIFIED'").length,1);
@@ -801,7 +806,9 @@ test('refund worker recovers a lost submission after lease expiry and completes 
     const webhook=()=>f.webhook('fixture-refund-processed','refund.processed','fixture-refund',paymentId);
     assert.equal((await webhook()).status,200);
     assert.equal((await webhook()).status,200);
+    await webhookWorker(f).runOnce();
     assert.equal((await f.webhook('fixture-refund-older','refund.created','fixture-refund',paymentId)).status,200);
+    await webhookWorker(f).runOnce();
    }finally{restarted.close();release.resolve();await old;}
    assert.equal(submissions,1);
    assert.equal(f.engine.one('SELECT status FROM refund_operations')?.status,'COMPLETED');
@@ -1121,5 +1128,268 @@ test('a missing notification template enters manual review without spending quot
   assert.equal(f.engine.one('SELECT count(*) AS n FROM email_submission_budget')?.n,0);
   assert.equal(calls,0);
   assert.equal(f.engine.booking('lotus',f.session,booking.id).state,'CONFIRMED');
+ }finally{await f.close();}
+});
+
+function webhookWorker(f:Awaited<ReturnType<typeof fixture>>,options:ConstructorParameters<typeof ReconciliationWorker>[3]={},log?: (line:string)=>void){
+ return new ReconciliationWorker(f.engine,f.payments,f.provider,{graceMs:Number.MAX_SAFE_INTEGER,retryMs:1,...options},log);
+}
+
+function signedWebhook(base:string,body:string,options:{id?:string;signature?:string;clinic?:string}={}){
+ return fetch(base+'/api/payments/webhook',{method:'POST',headers:{
+  'Content-Type':'application/json',
+  ...(options.signature===undefined?{'X-Razorpay-Signature':signature('fixture-webhook-secret',body)}:
+    options.signature?{'X-Razorpay-Signature':options.signature}:{}),
+  ...(options.id?{'X-Razorpay-Event-Id':options.id}:{}),
+  ...(options.clinic?{'X-Clinic-Id':options.clinic}:{}),
+ },body});
+}
+
+test('Razorpay webhook rejects unsafe configuration, unsigned or modified bodies, and oversized requests',async()=>{
+ const body=JSON.stringify({event:'fixture.unknown'});
+ for(const secret of ['', 'fixture-secret']){
+  const f=await fixture(':memory:',secret);
+  try{
+   const response=await signedWebhook(f.base,body);
+   assert.equal(response.status,503);
+   assert.equal((await response.json()).error.code,'WEBHOOK_NOT_CONFIGURED');
+  }finally{await f.close();}
+ }
+ const f=await fixture();
+ try{
+  assert.equal((await signedWebhook(f.base,body,{signature:''})).status,400);
+  assert.equal((await signedWebhook(f.base,body+' ',{signature:signature('fixture-webhook-secret',body)})).status,400);
+  assert.equal((await signedWebhook(f.base,body,{id:'invalid event id'})).status,400);
+  assert.equal((await signedWebhook(f.base,' '.repeat(65537))).status,413);
+  const unmapped=JSON.stringify({event:'payment.captured',payload:{payment:{entity:{id:'missing-payment',order_id:'missing-order'}}}});
+  const unmappedResponse=await signedWebhook(f.base,unmapped,{id:'fixture-unmapped'});
+  assert.equal(unmappedResponse.status,503);
+  assert.equal((await unmappedResponse.json()).error.code,'WEBHOOK_PAYMENT_UNMAPPED');
+  assert.equal(f.engine.all('SELECT * FROM payment_webhook_events').length,0);
+  const accepted=await signedWebhook(f.base,body,{id:'fixture-unknown'});
+  assert.equal(accepted.status,200);
+  assert.equal((await signedWebhook(f.base,body,{id:'fixture-unknown'})).status,200);
+  assert.equal((await signedWebhook(f.base,JSON.stringify({event:'fixture.other'}),{id:'fixture-unknown'})).status,400);
+  assert.equal(f.engine.all('SELECT * FROM payment_webhook_events WHERE processed_at IS NOT NULL').length,1);
+ }finally{await f.close();}
+});
+
+test('concurrent order.paid duplicates use one provider lookup and late capture stays scoped to its clinic',async()=>{
+ const f=await fixture();
+ try{
+  const hold=await f.verifiedHold();
+  const checkout=await f.pay(hold.id);
+  const {razorpay_order_id:order,razorpay_payment_id:id}=checkout.body;
+  const payload={payment:{entity:{id,order_id:order}},order:{entity:{id:order}}};
+  const body=JSON.stringify({event:'order.paid',payload});
+  const mismatch=JSON.stringify({event:'order.paid',payload:{...payload,order:{entity:{id:'different'}}}});
+  assert.equal((await signedWebhook(f.base,mismatch,{id:'mismatch'})).status,400);
+  const lookup=f.provider.payment.bind(f.provider),entered=signal(),release=signal();
+  let calls=0;
+  f.provider.payment=async key=>{calls++;entered.resolve();await release.promise;return lookup(key);};
+  f.advance(300001);
+  const first=signedWebhook(f.base,body,{id:'same-paid',clinic:'harbor'});
+  const duplicate=signedWebhook(f.base,body,{id:'same-paid'});
+  assert.deepEqual((await Promise.all([first,duplicate])).map(r=>r.status),[200,200]);
+  assert.equal(f.engine.all("SELECT id FROM reconciliation_jobs WHERE kind='WEBHOOK'").length,1);
+  const processing=webhookWorker(f).runOnce();
+  await entered.promise;
+  assert.equal(await webhookWorker(f).runOnce(),false);
+  release.resolve();
+  await processing;
+  assert.equal(calls,1);
+  assert.deepEqual({...f.engine.one('SELECT clinic_id,state FROM payments WHERE hold_id=?',hold.id)},
+   {clinic_id:'lotus',state:'REFUND_PENDING'});
+  assert.equal(f.engine.all('SELECT * FROM refund_operations WHERE clinic_id=?','lotus').length,1);
+  assert.equal(f.engine.all('SELECT * FROM appointments').length,0);
+ }finally{await f.close();}
+});
+
+test('acknowledged webhook resumes after restart and invalid provider evidence never marks it processed',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'clinic-webhook-'));
+ const path=join(dir,'clinic.db');
+ try{
+  let body='',order='',id='',amount=0;
+  const first=await fixture(path);
+  try{
+   const hold=await first.verifiedHold(),checkout=await first.pay(hold.id);
+   order=checkout.body.razorpay_order_id;id=checkout.body.razorpay_payment_id;amount=hold.fee;
+   body=JSON.stringify({event:'payment.captured',payload:{payment:{entity:{id,order_id:order}}}});
+   first.provider.payment=async()=>{throw Error('private provider credential');};
+   const response=await signedWebhook(first.base,body,{id:'restart-fixture'});
+   assert.equal(response.status,200);
+   assert.doesNotMatch(await response.text(),/private provider credential|fixture-webhook-secret/);
+   assert.equal(first.engine.one("SELECT processed_at FROM payment_webhook_events WHERE id='restart-fixture'")?.processed_at,null);
+  }finally{await first.close();}
+
+  const restarted=await fixture(path);
+  try{
+   const logs:string[]=[];
+   const worker=webhookWorker(restarted,{},line=>logs.push(line));
+   restarted.provider.payment=async()=>{throw Error('private provider credential');};
+   assert.equal(await worker.runOnce(),true);
+   assert.doesNotMatch(logs.join(' '),/private provider credential|fixture-webhook-secret/);
+   restarted.advance(1);
+   restarted.provider.payment=async()=>({id:'different',order_id:order,amount,currency:'INR',status:'captured'});
+   assert.equal(await worker.runOnce(),true);
+   restarted.advance(2);
+   restarted.provider.payment=async()=>({id,order_id:order,amount:amount+1,currency:'INR',status:'captured'});
+   assert.equal(await worker.runOnce(),true);
+   assert.equal(restarted.engine.one('SELECT state FROM payments WHERE order_id=?',order)?.state,'CREATED');
+   restarted.advance(4);
+   restarted.provider.payment=async()=>({id,order_id:order,amount,currency:'INR',status:'captured'});
+   assert.equal(await worker.runOnce(),true);
+   assert.equal((await signedWebhook(restarted.base,body,{id:'restart-fixture'})).status,200);
+   assert.equal(restarted.engine.one('SELECT state FROM payments WHERE order_id=?',order)?.state,'VERIFIED');
+   assert.ok(restarted.engine.one("SELECT processed_at FROM payment_webhook_events WHERE id='restart-fixture'")?.processed_at);
+   assert.equal(restarted.engine.all('SELECT * FROM appointments').length,0);
+  }finally{await restarted.close();}
+ }finally{rmSync(dir,{recursive:true});}
+});
+
+test('refund.failed webhook uses provider evidence and cannot submit or complete a refund',async()=>{
+ const f=await fixture();
+ try{
+  const hold=await f.verifiedHold(),checkout=await f.pay(hold.id);
+  f.advance(300001);
+  await checkout.verify();
+  const row=f.engine.one('SELECT id,amount FROM refund_operations')!;
+  f.engine.run("UPDATE refund_operations SET status='PROCESSING',submitted_at=? WHERE id=?",f.engine.now(),row.id);
+  const paymentId=checkout.body.razorpay_payment_id;
+  f.provider.refund=async id=>({id,payment_id:paymentId,amount:row.amount,currency:'INR',status:'failed',receipt:row.id});
+  let submits=0;
+  f.provider.createRefund=async()=>{submits++;throw Error('Unexpected refund submission');};
+  const deliver=()=>f.webhook('refund-failed-fixture','refund.failed','fixture-failed-refund',paymentId);
+  assert.equal((await deliver()).status,200);
+  assert.equal((await deliver()).status,200);
+  await webhookWorker(f).runOnce();
+  assert.equal(f.engine.one('SELECT status FROM refund_operations WHERE id=?',row.id)?.status,'MANUAL');
+  assert.equal(f.engine.one('SELECT state FROM payments WHERE hold_id=?',hold.id)?.state,'REFUND_PENDING');
+  assert.equal(f.engine.all('SELECT id FROM refund_operations').length,1);
+  assert.equal(submits,0);
+ }finally{await f.close();}
+});
+
+test('durable webhook acknowledgement is independent of a blocked provider lookup',async(t)=>{
+ const f=await fixture();
+ const entered=signal(),release=signal();
+ let processing:Promise<boolean>|undefined;
+ try{
+  const hold=await f.verifiedHold(),{body}=await f.pay(hold.id);
+  const lookup=f.provider.payment.bind(f.provider);
+  let calls=0;
+  f.provider.payment=async id=>{calls++;entered.resolve();await release.promise;return lookup(id);};
+  const deliver=()=>f.webhook('latency-fixture','payment.captured',body.razorpay_payment_id,body.razorpay_order_id);
+  const measure=async()=>{
+   const start=performance.now();
+   assert.equal((await deliver()).status,200);
+   return performance.now()-start;
+  };
+  const initial=await measure();
+  assert.equal(calls,0);
+  assert.equal(f.engine.one("SELECT status FROM reconciliation_jobs WHERE operation_ref='latency-fixture'")?.status,'PENDING');
+  processing=webhookWorker(f).runOnce();
+  await entered.promise;
+  const duplicate=await measure();
+  assert.equal(calls,1);
+  assert.ok(initial<5000&&duplicate<5000);
+  t.diagnostic('Webhook acknowledgement: initial '+initial.toFixed(1)+' ms, duplicate with provider blocked '+duplicate.toFixed(1)+' ms');
+ }finally{release.resolve();await processing;await f.close();}
+});
+
+test('webhook acknowledgement fails on SQLite commit failure and recovers a historical receipt on redelivery',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'clinic-webhook-migration-'));
+ const path=join(dir,'clinic.db');
+ try{
+  let body:string;
+  const first=await fixture(path);
+  try{
+   const hold=await first.verifiedHold(),checkout=await first.pay(hold.id);
+   body=JSON.stringify({event:'payment.captured',payload:{payment:{entity:{id:checkout.body.razorpay_payment_id,order_id:checkout.body.razorpay_order_id}}}});
+   first.db.exec('DROP TABLE payment_webhook_events; CREATE TABLE payment_webhook_events(id TEXT PRIMARY KEY,body_hash TEXT NOT NULL,processed_at INTEGER);');
+   // Recreate the legacy schema and preserve both pending and already processed receipts.
+   const hash=createHash('sha256').update(body).digest('hex');
+   first.engine.run('INSERT INTO payment_webhook_events VALUES(?,?,NULL)','legacy-pending',hash);
+   first.engine.run('INSERT INTO payment_webhook_events VALUES(?,?,?)','legacy-done',hash,1);
+  }finally{await first.close();}
+  const f=await fixture(path);
+  try{
+   assert.equal((await signedWebhook(f.base,body!,{id:'legacy-done'})).status,200);
+   assert.equal(f.engine.one("SELECT event_type FROM payment_webhook_events WHERE id='legacy-done'")?.event_type,null);
+   f.db.exec(`CREATE TABLE fixture_commit_parent(id INTEGER PRIMARY KEY);
+    CREATE TABLE fixture_commit_child(id INTEGER REFERENCES fixture_commit_parent(id) DEFERRABLE INITIALLY DEFERRED);
+    CREATE TRIGGER fixture_commit_failure AFTER INSERT ON reconciliation_jobs
+    WHEN NEW.kind='WEBHOOK' BEGIN INSERT INTO fixture_commit_child VALUES(1); END;`);
+   const failed=await signedWebhook(f.base,body!,{id:'legacy-pending'});
+   assert.equal(failed.status,503);
+   assert.equal((await failed.json()).error.code,'WEBHOOK_PERSISTENCE_UNAVAILABLE');
+   assert.equal(f.engine.one("SELECT event_type FROM payment_webhook_events WHERE id='legacy-pending'")?.event_type,null);
+   assert.equal(f.engine.all("SELECT id FROM reconciliation_jobs WHERE kind='WEBHOOK'").length,0);
+   f.db.exec('DROP TRIGGER fixture_commit_failure;');
+   assert.equal((await signedWebhook(f.base,body!,{id:'legacy-pending'})).status,200);
+   assert.equal(f.engine.one("SELECT event_type FROM payment_webhook_events WHERE id='legacy-pending'")?.event_type,'payment.captured');
+   assert.equal(f.engine.all("SELECT id FROM reconciliation_jobs WHERE kind='WEBHOOK'").length,1);
+  }finally{await f.close();}
+ }finally{rmSync(dir,{recursive:true});}
+});
+
+test('a second worker recovers expired webhook leases and finalizes a receipt after a completion-write failure',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'clinic-webhook-lease-'));
+ const path=join(dir,'clinic.db');
+ const f=await fixture(path);
+ try{
+  const hold=await f.verifiedHold(),checkout=await f.pay(hold.id);
+  const {razorpay_payment_id:id,razorpay_order_id:order}=checkout.body;
+  const lookup=f.provider.payment.bind(f.provider),entered=signal(),release=signal();
+  let calls=0;
+  f.provider.payment=async id=>{if(++calls===1){entered.resolve();await release.promise;}return lookup(id);};
+  assert.equal((await f.webhook('lease-fixture','payment.captured',id,order)).status,200);
+  const old=webhookWorker(f,{leaseMs:50}).runOnce();
+  await entered.promise;
+  const other=openDb(path);
+  try{
+   const engine=new Engine(other,f.engine.adapters,undefined,f.engine.now);
+   const worker=new ReconciliationWorker(engine,new Payments(engine,f.provider),f.provider,{leaseMs:50,graceMs:Number.MAX_SAFE_INTEGER});
+   assert.equal(await worker.runOnce(),false);
+   f.advance(51);
+   other.exec(`CREATE TRIGGER fixture_completion_failure BEFORE UPDATE OF status ON reconciliation_jobs
+    WHEN NEW.status='DONE' BEGIN SELECT RAISE(ABORT,'fixture completion write failed'); END;`);
+   await assert.rejects(worker.runOnce(),/fixture completion write failed/);
+   assert.equal(engine.one('SELECT state FROM payments WHERE hold_id=?',hold.id)?.state,'VERIFIED');
+   assert.equal(engine.one("SELECT processed_at FROM payment_webhook_events WHERE id='lease-fixture'")?.processed_at,null);
+   other.exec('DROP TRIGGER fixture_completion_failure;');
+   f.advance(51);
+   assert.equal(await worker.runOnce(),true);
+   assert.equal(calls,2);
+   assert.equal(engine.all("SELECT id FROM audit WHERE action='PAYMENT_VERIFIED'").length,1);
+   assert.ok(engine.one("SELECT processed_at FROM payment_webhook_events WHERE id='lease-fixture'")?.processed_at);
+  }finally{release.resolve();await old;other.close();}
+ }finally{await f.close();rmSync(dir,{recursive:true});}
+});
+
+test('webhook retry exhaustion is clinic scoped, redacted and requires an explicit requeue',async()=>{
+ const f=await fixture();
+ try{
+  const hold=await f.verifiedHold(),{body}=await f.pay(hold.id);
+  f.provider.payment=async()=>{throw Error('private fixture credential');};
+  assert.equal((await f.webhook('manual-fixture','payment.captured',body.razorpay_payment_id,body.razorpay_order_id)).status,200);
+  const worker=webhookWorker(f,{maxAttempts:2});
+  assert.equal(await worker.runOnce(),true);
+  f.advance(1);
+  assert.equal(await worker.runOnce(),true);
+  assert.equal(await worker.runOnce(),false);
+  const login=async(clinic:string)=>(await f.request('/api/admin/login','POST',{email:clinic+'@demo.invalid',password:'test-password-123'})).data.token;
+  const lotus=await login('lotus'),harbor=await login('harbor');
+  const list=(clinic:string,token:string)=>f.request('/api/admin/reconciliation','GET',undefined,undefined,clinic,token);
+  assert.deepEqual((await list('harbor',harbor)).data,[]);
+  const rows=(await list('lotus',lotus)).data;
+  assert.equal(rows[0].kind,'WEBHOOK');
+  assert.equal(rows[0].status,'MANUAL');
+  assert.equal(rows[0].reason,'RETRY_LIMIT');
+  assert.doesNotMatch(JSON.stringify(rows),/manual-fixture|private fixture credential/);
+  const base='/api/admin/reconciliation/'+rows[0].id;
+  assert.equal((await f.request(base+'/resolve','POST',{reason:'Fixture'},undefined,'lotus',lotus)).status,400);
+  assert.equal((await f.request(base+'/requeue','POST',{reason:'Fixture'},undefined,'lotus',lotus)).status,200);
+  assert.equal(f.engine.one("SELECT status FROM reconciliation_jobs WHERE operation_ref='manual-fixture'")?.status,'PENDING');
  }finally{await f.close();}
 });

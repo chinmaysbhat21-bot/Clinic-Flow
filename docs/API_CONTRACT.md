@@ -24,7 +24,7 @@ Base URL is `http://127.0.0.1:4000`. Send `Content-Type: application/json` for J
 | `POST /api/otp/verify` | patient | IMPLEMENTED AND VERIFIED |
 | `POST /api/payments/order` | patient | PARTIALLY IMPLEMENTED |
 | `POST /api/payments/verify` | patient | BLOCKED |
-| `POST /api/payments/webhook` | webhook | BLOCKED |
+| `POST /api/payments/webhook` | webhook | HTTP 200 means durable receipt; provider reconciliation runs in the background. HTTP 503 requests redelivery after storage or mapping failure. [External Test Mode delivery pending](RAZORPAY_WEBHOOK_SETUP.md). |
 | `POST /api/bookings/confirm` | patient | BLOCKED |
 | `GET /api/bookings/{id}` | patient | BLOCKED |
 | `POST /api/bookings/{id}/cancel` | patient | BLOCKED |
@@ -35,7 +35,7 @@ Base URL is `http://127.0.0.1:4000`. Send `Content-Type: application/json` for J
 | `POST /api/admin/login` | public | IMPLEMENTED AND VERIFIED |
 | `GET /api/admin/appointments` | admin | IMPLEMENTED AND VERIFIED |
 | `GET /api/admin/overview` | admin | IMPLEMENTED BUT UNVERIFIED |
-| `GET /api/admin/reconciliation` | admin | IMPLEMENTED AND VERIFIED |
+| `GET /api/admin/reconciliation` | admin | Includes clinic-scoped `WEBHOOK` jobs. An authorized administrator can requeue a manual webhook job; its outcome requires worker evidence. |
 | `GET /api/admin/notifications` | admin | IMPLEMENTED AND VERIFIED. `ACCEPTED` indicates provider acceptance. Rendering failures appear as `MANUAL` with reason `RENDER_FAILED`. |
 | `GET /api/admin/config` | admin | IMPLEMENTED BUT UNVERIFIED |
 | `PATCH /api/admin/config` | admin | IMPLEMENTED BUT UNVERIFIED |

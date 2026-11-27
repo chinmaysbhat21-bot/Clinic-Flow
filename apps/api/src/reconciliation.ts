@@ -2,9 +2,10 @@ import { randomUUID } from 'node:crypto';
 import { Engine } from './core.js';
 import { transaction } from './db.js';
 import { Payments, type PaymentProvider } from './payments.js';
+import { RefundWorker } from './refund-worker.js';
 import { applyProviderEvidence } from './recovery.js';
 
-type Kind = 'ORDER' | 'CAPTURE' | 'REFUND' | 'CONFIRM' | 'CANCEL' | 'RESCHEDULE';
+type Kind = 'WEBHOOK' | 'ORDER' | 'CAPTURE' | 'REFUND' | 'CONFIRM' | 'CANCEL' | 'RESCHEDULE';
 type Job = {id:string;clinic_id:string;kind:Kind;operation_ref:string;generation:number;attempts:number;lease_token:string};
 type Outcome = 'DONE' | 'RETRY' | 'MANUAL';
 export type WorkerOptions = {pollMs:number; leaseMs:number; graceMs:number; maxAttempts:number; retryMs:number};
@@ -16,7 +17,8 @@ export class ReconciliationWorker {
  private options: WorkerOptions;
 
  constructor(private engine:Engine, private payments:Payments, private provider:PaymentProvider,
-  options:Partial<WorkerOptions>={}, private log:(message:string)=>void=()=>{}) {
+  options:Partial<WorkerOptions>={}, private log:(message:string)=>void=()=>{},
+  private refunds=new RefundWorker(engine.db,provider,false,engine.now)) {
   this.options={...defaults,...options};
  }
 
@@ -72,14 +74,37 @@ export class ReconciliationWorker {
   if(outcome==='RETRY')reason??='EVIDENCE_PENDING';
   const delay=Math.min(3600000,this.options.retryMs*2**Math.min(job.attempts-1,16));
   const e=this.engine;
-  const updated=e.run(`UPDATE reconciliation_jobs SET status=?,next_at=?,last_error=?,lease_until=NULL,lease_token=NULL
+  const updated=transaction(e.db,()=>{
+   const changed=e.run(`UPDATE reconciliation_jobs SET status=?,next_at=?,last_error=?,lease_until=NULL,lease_token=NULL
    WHERE id=? AND lease_token=? AND lease_until>?`,outcome==='RETRY'?'PENDING':outcome,e.now()+delay,reason,job.id,job.lease_token,e.now());
+   if(changed.changes&&job.kind==='WEBHOOK'&&outcome==='DONE'){
+    e.run('UPDATE payment_webhook_events SET processed_at=? WHERE id=? AND processed_at IS NULL',e.now(),job.operation_ref);
+   }
+   return changed;
+  });
   if(updated.changes)this.log(JSON.stringify({event:'reconciliation_attempt',jobId:job.id,kind:job.kind,outcome,attempt:job.attempts}));
   return true;
  }
 
  private async process(job:Job):Promise<Outcome>{
   const e=this.engine, ref=job.operation_ref;
+  if(job.kind==='WEBHOOK'){
+   const receipt=e.one('SELECT * FROM payment_webhook_events WHERE id=?',ref);
+   if(!receipt?.event_type||!receipt.payment_id)return 'MANUAL';
+   if(receipt.processed_at!==null)return 'DONE';
+   if(receipt.refund_id){
+    const payment=e.one('SELECT id FROM payments WHERE payment_id=? AND clinic_id=?',receipt.payment_id,job.clinic_id);
+    if(!payment)return 'MANUAL';
+    return this.refunds.webhook(receipt.payment_id,receipt.refund_id,()=>this.owns(job));
+   }
+   const payment=e.one(`SELECT p.hold_id,h.session_id FROM payments p
+    JOIN holds h ON h.id=p.hold_id AND h.clinic_id=p.clinic_id
+    WHERE p.order_id=? AND p.clinic_id=?`,receipt.order_id,job.clinic_id);
+   if(!payment)return 'MANUAL';
+   await this.payments.reconcile(job.clinic_id,payment.session_id,payment.hold_id,receipt.order_id,
+    receipt.payment_id,receipt.event_type==='payment.failed',()=>this.owns(job));
+   return 'DONE';
+  }
   const hold=e.one('SELECT * FROM holds WHERE id=? AND clinic_id=?',ref,job.clinic_id);
   if(!hold)return 'DONE';
   if(job.kind==='ORDER'){
