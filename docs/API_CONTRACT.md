@@ -31,7 +31,7 @@ Base URL is `http://127.0.0.1:4000`. Send `Content-Type: application/json` for J
 | `POST /api/bookings/{id}/briefing` | patient | PARTIALLY IMPLEMENTED |
 | `POST /api/chat` | patient | BLOCKED |
 | `POST /api/admin/login` | public | IMPLEMENTED AND VERIFIED |
-| `GET /api/admin/appointments` | admin | BLOCKED |
+| `GET /api/admin/appointments` | admin | IMPLEMENTED AND VERIFIED |
 | `GET /api/admin/overview` | admin | IMPLEMENTED BUT UNVERIFIED |
 | `GET /api/admin/config` | admin | IMPLEMENTED BUT UNVERIFIED |
 | `PATCH /api/admin/config` | admin | IMPLEMENTED BUT UNVERIFIED |
@@ -73,9 +73,9 @@ Base URL is `http://127.0.0.1:4000`. Send `Content-Type: application/json` for J
 | PatientBriefing | Shared request accepts a patient-reported summary of 1–2000 characters; response only acknowledges simulation. |
 | APIError | Shared TypeScript ApiResponse union; current error schema in OpenAPI. No shared runtime response validators. |
 
-**Unsafe current responses.** Hold, appointment and several tool handlers return raw records. The admin appointment list and action responses expose an active patient session credential. The OpenAPI appointment and hold schemas describe the visible useful fields, not complete raw bodies or a guarantee of redaction. Restrict blocked routes to isolated local testing. Do not persist, display or forward internal fields.
+**Unsafe current responses.** Hold, appointment and several tool handlers return raw records. Admin appointment list and action responses return only the seven fields in AppointmentProjection. The OpenAPI appointment and hold schemas describe the visible useful fields, not complete raw bodies or a guarantee of redaction. Restrict blocked routes to isolated local testing. Do not persist, display or forward internal fields.
 
-**Proposed safe contract.** Keep paths and envelopes, but return only the documented appointment and hold projections. Review these with Jay and Nandan before adopting. Add separate schemas for appointment, payment verification, and refund states. This changes current serialization and needs approval.
+**Proposed safe contract.** Keep paths and envelopes, and extend field allowlists to patient appointment and hold responses. Review these with Jay and Nandan before adopting. Add separate schemas for appointment, payment verification, and refund states. This changes current serialization and needs approval.
 
 ## Proposed or missing capabilities
 

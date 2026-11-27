@@ -25,7 +25,7 @@ Razorpay creates an INR order for the stored hold fee and reads the provider pay
 
 ## Outstanding risks
 
-- Admin appointment list and mutation responses expose reusable patient session credentials. Raw patient holds, bookings and tools expose internal fields. Project explicit DTOs before sharing.
+- Raw patient holds, bookings and tools expose internal fields. Project explicit DTOs before sharing.
 - A callback can update stale state after awaited lookup. Provider order dedupe is in-memory and does not recover an upstream success without a local row. Use transactional conditional updates and durable reconciliation after approval.
 - Cancellation and reschedule can race across external calls. Replacement ownership and fee are checked, but replacement state is insufficiently restricted. Ambiguous adapter outcomes lack a recovery worker.
 - Fixed Kolkata offset, one Google calendar per runtime, loopback-only bind, process-local rate limiting and no deployment/persistence smoke test. Health checks key presence, not provider readiness.
