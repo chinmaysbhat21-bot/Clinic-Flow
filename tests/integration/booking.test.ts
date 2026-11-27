@@ -6,6 +6,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { reconcileOffline } from '../../apps/api/src/recovery.js';
+import { configureOtpDelivery } from '../../apps/api/src/otp-delivery.js';
 import { Payments } from '../../apps/api/src/payments.js';
 import { Engine } from '../../apps/api/src/core.js';
 import { expireHolds,openDb,seed,transaction } from '../../apps/api/src/db.js';
@@ -125,7 +126,8 @@ test('expiry wins before confirmation on a second connection for verified and de
 async function fixture(path = ':memory:'){
  const db=openDb(path);seed(db,'test-password-123');let now=Date.parse('2026-12-01T00:00:00Z');const codes=new Map<string,string>();const orders=new Map<string,number>();const captured=new Map<string,{order:string;amount:number}>();
  const provider:PaymentProvider={keyId:'rzp_test_fixture',secret:'fixture-secret',async order(amount){const id=randomUUID();orders.set(id,amount);return {id,amount,currency:'INR'};},async payment(id){const p=captured.get(id)!;return {id,order_id:p.order,amount:p.amount,currency:'INR',status:'captured'};}};
- const state=createApp(db,{mockKey:'fixture-only-key',provider,now:()=>now,otpSink:(id,code)=>codes.set(id,code)});
+ const webhookSecret='fixture-webhook-secret';
+ const state=createApp(db,{mockKey:'fixture-only-key',webhookSecret,provider,now:()=>now,otpSink:(id,code)=>codes.set(id,code)});
  const server=state.app.listen(0,'127.0.0.1');await once(server,'listening');const addr=server.address() as {port:number};const base=`http://127.0.0.1:${addr.port}`;
  // Redirect mock adapter to this ephemeral HTTP server.
  const { MockAdapter }=await import('../../apps/api/src/adapters.js');const original=state.engine.adapters;state.engine.adapters=c=>c==='lotus'?new MockAdapter(`${base}/mock`,c,'fixture-only-key'):original(c);
@@ -136,8 +138,70 @@ async function fixture(path = ':memory:'){
  const reserve=()=>request('/api/holds','POST',input,session);
  async function verifiedHold(){await consent();const h=(await reserve()).data;await request('/api/otp/send','POST',{holdId:h.id,phone:'+919999999999'},session);const r=await request('/api/otp/verify','POST',{holdId:h.id,phone:'+919999999999',code:codes.get(h.id)},session);assert.equal(r.status,200);return h;}
  async function pay(id:string){const r=await request('/api/payments/order','POST',{holdId:id},session);assert.equal(r.status,200,JSON.stringify(r));const order=r.data;const paymentId=randomUUID();captured.set(paymentId,{order:order.orderId,amount:order.amount});const body={holdId:id,razorpay_order_id:order.orderId,razorpay_payment_id:paymentId,razorpay_signature:signature(provider.secret,`${order.orderId}|${paymentId}`)};return {body,verify:()=>request('/api/payments/verify','POST',body,session)};}
- return {...state,provider,db,request,session,codes,input,consent,reserve,verifiedHold,pay,advance:(ms:number)=>{now+=ms;},close:async()=>{server.closeAllConnections();await new Promise<void>(r=>server.close(()=>r()));db.close();}};
+ async function webhook(eventId:string,event:string,id:string,order_id:string,valid=true){
+  const body=JSON.stringify({event,payload:{payment:{entity:{id,order_id}}}});
+  return fetch(base+'/api/payments/webhook',{method:'POST',headers:{'Content-Type':'application/json','X-Razorpay-Event-Id':eventId,'X-Razorpay-Signature':valid?signature(webhookSecret,body):'invalid'},body});
+ }
+ return {...state,provider,db,request,webhook,session,codes,input,consent,reserve,verifiedHold,pay,advance:(ms:number)=>{now+=ms;},close:async()=>{server.closeAllConnections();await new Promise<void>(r=>server.close(()=>r()));db.close();}};
 }
+
+test('local OTP delivery requires explicit development configuration',()=>{
+ const lines:string[]=[];
+ const delivery=configureOtpDelivery('development','development-console',line=>lines.push(line));
+ delivery?.deliver('fixture-hold','123456','+12025550123');
+ assert.deepEqual(lines,['[local OTP] hold=fixture-hold code=123456']);
+ assert.throws(()=>configureOtpDelivery('production','development-console'),/unsafe/);
+ assert.throws(()=>configureOtpDelivery(undefined,'development-console'),/unsafe/);
+ assert.equal(configureOtpDelivery('production','disabled'),undefined);
+});
+
+test('OTP expires independently of the hold and a verified code cannot be reused',async()=>{
+ const f=await fixture();
+ try {
+  await f.consent();
+  const hold=(await f.reserve()).data;
+  const input={holdId:hold.id,phone:'+12025550123'};
+  await f.request('/api/otp/send','POST',input,f.session);
+  f.advance(180001);
+  const verify=()=>f.request('/api/otp/verify','POST',{...input,code:f.codes.get(hold.id)},f.session);
+  assert.equal((await verify()).error.code,'OTP_INVALID_OR_EXPIRED');
+  assert.equal((await f.request('/api/otp/send','POST',input,f.session)).status,200);
+  assert.equal((await verify()).data.state,'OTP_VERIFIED');
+  assert.equal((await verify()).error.code,'OTP_INVALID_OR_EXPIRED');
+ } finally {await f.close();}
+});
+
+test('signed webhook retries, failed events and concurrent capture share payment state',async()=>{
+ const f=await fixture();
+ try {
+  const hold=await f.verifiedHold();
+  const payment=await f.pay(hold.id);
+  const {razorpay_payment_id:id,razorpay_order_id:order}=payment.body;
+  const lookup=f.provider.payment.bind(f.provider);
+  f.provider.payment=async ()=>({...await lookup(id),id:'failed-attempt',status:'failed'});
+  assert.equal((await f.webhook('bad','payment.failed','failed-attempt',order,false)).status,400);
+  assert.equal((await f.webhook('failed','payment.failed','failed-attempt',order)).status,200);
+  assert.equal(f.engine.one('SELECT state FROM payments WHERE hold_id=?',hold.id)?.state,'FAILED');
+  f.provider.payment=async id=>({...await lookup(id),currency:'USD'});
+  assert.equal((await f.webhook('captured','payment.captured',id,order)).status,400);
+  f.provider.payment=async id=>({...await lookup(id),amount:1});
+  assert.equal((await payment.verify()).error.code,'PAYMENT_NOT_CAPTURED');
+  const entered=signal(),release=signal();
+  let calls=0;
+  f.provider.payment=async id=>{if(++calls===1){entered.resolve();await release.promise;}return lookup(id);};
+  const webhook=f.webhook('captured','payment.captured',id,order);
+  await entered.promise;
+  try {assert.equal((await payment.verify()).data.state,'PAYMENT_VERIFIED');}
+  finally {release.resolve();}
+  assert.equal((await webhook).status,200);
+  assert.equal((await f.webhook('captured','payment.captured',id,order)).status,200);
+  assert.equal((await f.webhook('late-failure','payment.failed','failed-attempt',order)).status,200);
+  assert.equal(calls,2);
+  assert.equal(f.engine.one('SELECT state FROM payments WHERE hold_id=?',hold.id)?.state,'VERIFIED');
+  assert.equal(f.engine.all("SELECT id FROM audit WHERE action='PAYMENT_VERIFIED'").length,1);
+  assert.equal((await f.engine.confirm('lotus',f.session,hold.id)).state,'CONFIRMED');
+ } finally {await f.close();}
+});
 test('delayed duplicate capture and simultaneous confirmation preserve confirmed state', async () => {
  const f=await fixture();
  try {

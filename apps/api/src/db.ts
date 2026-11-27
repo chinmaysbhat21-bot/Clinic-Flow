@@ -23,6 +23,9 @@ export function openDb(path:string){
  CREATE TABLE IF NOT EXISTS payment_order_attempts(
   hold_id TEXT PRIMARY KEY REFERENCES holds(id), amount INTEGER NOT NULL, started_at INTEGER NOT NULL
  );
+ CREATE TABLE IF NOT EXISTS payment_webhook_events(
+  id TEXT PRIMARY KEY, body_hash TEXT NOT NULL, processed_at INTEGER
+ );
  CREATE TABLE IF NOT EXISTS booking_operations(
   booking_key TEXT PRIMARY KEY REFERENCES holds(id), kind TEXT NOT NULL,
   replacement_id TEXT REFERENCES holds(id), started_at INTEGER NOT NULL

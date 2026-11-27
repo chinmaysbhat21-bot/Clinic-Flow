@@ -2091,8 +2091,8 @@
     },
     "/api/payments/webhook": {
       "post": {
-        "summary": "Reconcile payment.captured; acknowledge other signed events",
-        "description": "Reconcile payment.captured; acknowledge other signed events. Sign original raw body. Shares callback race. No automatic confirmation.",
+        "summary": "Reconcile payment.captured and payment.failed",
+        "description": "Reconcile payment.captured and payment.failed. Verifies original raw bytes, deduplicates by event ID or body digest, and uses atomic payment reconciliation. Other signed events are acknowledged. No automatic confirmation.",
         "x-implementation-status": "BLOCKED",
         "x-owner": "Chinmay",
         "x-source": "apps/api/src/server.ts:createApp",

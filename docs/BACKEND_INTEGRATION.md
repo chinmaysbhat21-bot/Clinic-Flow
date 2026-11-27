@@ -31,6 +31,6 @@ Razorpay creates an INR order for the stored hold fee and reads the provider pay
 - Ambiguous orders and booking operations remain guarded across restart. Recovery is manual. Stop all API writers, confirm the outcome in authoritative provider records, and call reconcileOffline from apps/api/src/recovery.ts with verified evidence. Never clear a guard while the provider outcome is uncertain. No automatic reconciliation worker or provider refund execution exists.
 - A pending confirmation can occupy its appointment interval until reconciliation. Replacement holds are bounded to 24 hours. Resolve ambiguous moves promptly because a provider whose availability does not reflect the move can disagree with SQLite after that deadline.
 - Fixed Kolkata offset, one Google calendar per runtime, loopback-only bind, process-local rate limiting and no deployment/persistence smoke test. Health checks key presence, not provider readiness.
-- OTP is debugger-only and notification outbox is simulated. Never demo actual patient data.
+- Local console OTP requires explicit development mode. Notification outbox is simulated. See [local setup](OTP_RAZORPAY_TEST_MODE.md). Never demo actual patient data.
 
 Run `npm.cmd run build` and `npm.cmd test`. Integration tests use loopback HTTP, in-memory SQLite and a fake payment provider. Verify true provider behavior separately with authorized credentials.

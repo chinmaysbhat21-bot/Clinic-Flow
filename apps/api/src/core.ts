@@ -6,7 +6,7 @@ export function requireThat(ok:unknown,code:string,message=code,status=400):asse
 export function equal(a:string,b:string){const aa=Buffer.from(a),bb=Buffer.from(b);return aa.length===bb.length&&timingSafeEqual(aa,bb);}
 export type Row=Record<string,any>;
 export class Engine {
- constructor(public db:DB,public adapters:(clinic:string)=>BookingAdapter,public otpSink:(hold:string,code:string)=>void=()=>{},public now=()=>Date.now()){}
+ constructor(public db:DB,public adapters:(clinic:string)=>BookingAdapter,public otpSink:(hold:string,code:string,phone:string)=>void=()=>{},public now=()=>Date.now()){}
  one(sql:string,...args:any[]):Row|undefined{return this.db.prepare(sql).get(...args) as Row|undefined;}
  all(sql:string,...args:any[]):Row[]{return this.db.prepare(sql).all(...args) as Row[];}
  run(sql:string,...args:any[]){return this.db.prepare(sql).run(...args);}
@@ -39,7 +39,7 @@ export class Engine {
  try{const external=await this.adapters(clinic).holdSlot({id:h.id,doctorId:h.doctor_id,start:h.start,end:h.end,expiresAt:new Date(h.expires_at).toISOString()});this.run('UPDATE holds SET external_id=? WHERE id=?',external,h.id);return {...h,external_id:external};}catch(e){this.run("UPDATE holds SET state='CANCELLED' WHERE id=?",h.id);throw e;}
  }
  sendOtp(clinic:string,session:string,id:string,phone:string){const delivery=transaction(this.db,()=>{const h=this.hold(clinic,session,id);requireThat(['HELD','OTP_VERIFIED'].includes(h.state),'INVALID_STATE');const prior=this.one('SELECT * FROM otps WHERE hold_id=?',id);requireThat(!prior||this.now()-prior.sent_at>=60000,'OTP_COOLDOWN',undefined,429);
- const code=String(randomInt(100000,1000000)),salt=randomUUID();this.run('INSERT OR REPLACE INTO otps VALUES(?,?,?,?,?,?,0,?,0)',id,session,phone,scryptSync(code,salt,32).toString('hex'),salt,this.now()+180000,this.now());this.run("UPDATE holds SET state='HELD',phone=NULL WHERE id=?",id);return code;});this.otpSink(id,delivery);return {delivery:'DEVELOPMENT_OUTBOX',expiresIn:180};}
+ const code=String(randomInt(100000,1000000)),salt=randomUUID();this.run('INSERT OR REPLACE INTO otps VALUES(?,?,?,?,?,?,0,?,0)',id,session,phone,scryptSync(code,salt,32).toString('hex'),salt,this.now()+180000,this.now());this.run("UPDATE holds SET state='HELD',phone=NULL WHERE id=?",id);return code;});this.otpSink(id,delivery,phone);return {delivery:'DEVELOPMENT_OUTBOX',expiresIn:180};}
  verifyOtp(clinic:string,session:string,id:string,phone:string,code:string){const valid=transaction(this.db,()=>{const h=this.hold(clinic,session,id);requireThat(h.state==='HELD','OTP_INVALID_OR_EXPIRED');const otp=this.one('SELECT * FROM otps WHERE hold_id=? AND session_id=? AND phone=?',id,session,phone);requireThat(otp&&!otp.consumed&&otp.expires_at>this.now()&&otp.attempts<5,'OTP_INVALID_OR_EXPIRED');this.run('UPDATE otps SET attempts=attempts+1 WHERE hold_id=?',id);if(!equal(otp.hash,scryptSync(code,otp.salt,32).toString('hex')))return false;this.run('UPDATE otps SET consumed=1 WHERE hold_id=?',id);this.run("UPDATE holds SET state='OTP_VERIFIED',phone=? WHERE id=?",phone,id);return true;});requireThat(valid,'OTP_INVALID_OR_EXPIRED');return {state:'OTP_VERIFIED'};}
  async confirm(clinic:string,session:string,id:string){
  const a=transaction(this.db,()=>{
@@ -118,4 +118,4 @@ export class Engine {
  }
  briefing(clinic:string,session:string,id:string,summary:string,destination?:string){const a=this.booking(clinic,session,id);requireThat(a.state==='CONFIRMED','BOOKING_NOT_CONFIRMED');this.consent(clinic,session,true);requireThat(destination,'BRIEFING_DESTINATION_NOT_CONFIGURED');requireThat(this.one('SELECT id FROM doctors WHERE id=? AND clinic_id=?',a.doctor_id,clinic),'INVALID_DOCTOR');transaction(this.db,()=>{this.run('INSERT OR IGNORE INTO briefings VALUES(?,?,?,?)',id,clinic,summary,this.now());this.run('INSERT OR IGNORE INTO outbox VALUES(?,?,?,?,?,?,?,?)',randomUUID(),clinic,id,'BRIEFING',destination,JSON.stringify({bookingId:id}),'SIMULATED',null);});return {status:'SIMULATED',delivered:false};}
 }
-export function signature(secret:string,message:string){return createHmac('sha256',secret).update(message).digest('hex');}
+export function signature(secret:string,message:string|Buffer){return createHmac('sha256',secret).update(message).digest('hex');}
