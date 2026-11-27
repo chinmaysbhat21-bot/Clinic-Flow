@@ -2,13 +2,17 @@ import { randomUUID } from 'node:crypto';
 import { type DB, transaction } from './db.js';
 
 type Operation = 'CONFIRM' | 'CANCEL' | 'RESCHEDULE';
-type Evidence =
+export type Evidence =
  | { kind: 'ORDER'; clinicId: string; holdId: string; orderId: string; amount: number; currency: 'INR'; receipt: string }
  | { kind: Operation; clinicId: string; holdId: string; outcome: 'applied' | 'not-applied'; externalId?: string };
 
 /** Run offline, after checking authoritative provider records and stopping all API writers. */
 export function reconcileOffline(db: DB, evidence: Evidence, now = Date.now()) {
- return transaction(db, () => {
+ return transaction(db, () => applyProviderEvidence(db,evidence,now));
+}
+
+/** The caller must hold the SQLite write transaction and validate its operation claim. */
+export function applyProviderEvidence(db: DB, evidence: Evidence, now: number) {
   const hold = db.prepare('SELECT * FROM holds WHERE id=? AND clinic_id=?').get(evidence.holdId, evidence.clinicId);
   if (!hold) throw new Error('Unknown clinic hold');
   if (evidence.kind === 'ORDER') {
@@ -41,7 +45,9 @@ export function reconcileOffline(db: DB, evidence: Evidence, now = Date.now()) {
     if (!replacement) throw new Error('Replacement hold is missing');
     if (evidence.outcome === 'applied') {
      const overlap = db.prepare("SELECT id FROM appointments WHERE doctor_id=? AND id<>? AND state IN ('CONFIRMED','CONFIRMATION_PENDING') AND start<? AND end>?").get(replacement.doctor_id, appointment.id, replacement.end, replacement.start);
-     const held = db.prepare("SELECT id FROM holds WHERE doctor_id=? AND id<>? AND state NOT IN ('CANCELLED','EXPIRED','CONFIRMED') AND expires_at>? AND start<? AND end>?").get(replacement.doctor_id, replacement.id, now, replacement.end, replacement.start);
+     const held = db.prepare(`SELECT id FROM holds h WHERE doctor_id=? AND id<>? AND start<? AND end>?
+      AND ((state NOT IN ('CANCELLED','EXPIRED','CONFIRMED') AND expires_at>?)
+       OR EXISTS (SELECT 1 FROM booking_operations WHERE replacement_id=h.id))`).get(replacement.doctor_id, replacement.id, replacement.end, replacement.start, now);
      if (overlap || held) throw new Error('Replacement now conflicts. Resolve the provider conflict first.');
      db.prepare('UPDATE appointments SET start=?,end=? WHERE id=?').run(replacement.start, replacement.end, appointment.id);
      db.prepare('INSERT OR IGNORE INTO outbox VALUES(?,?,?,?,?,?,?,?)').run(randomUUID(), evidence.clinicId, appointment.id, `RESCHEDULE_${replacement.id}`, null, JSON.stringify({bookingId:appointment.id}), 'SIMULATED', null);
@@ -51,5 +57,4 @@ export function reconcileOffline(db: DB, evidence: Evidence, now = Date.now()) {
    db.prepare('DELETE FROM booking_operations WHERE booking_key=?').run(hold.id);
   }
   db.prepare('INSERT INTO audit VALUES(?,?,?,?,?)').run(randomUUID(), evidence.clinicId, `RECONCILED_${evidence.kind}`, hold.id, now);
- });
 }

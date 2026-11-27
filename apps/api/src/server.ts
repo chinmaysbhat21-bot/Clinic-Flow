@@ -9,7 +9,8 @@ import { Payments,RazorpayProvider,type PaymentProvider } from './payments.js';
 export function createApp(db:DB,options:{mockBase?:string;mockKey:string;webhookSecret?:string;otpSink?:(id:string,code:string,phone:string)=>void;provider?:PaymentProvider;now?:()=>number;origins?:string[]} ){
  const app=express();app.disable('x-powered-by');
  const engine:Engine=new Engine(db,clinic=>engine.clinic(clinic).adapter==='google'?new GoogleAdapter(process.env.GOOGLE_ACCESS_TOKEN??'',process.env.GOOGLE_CALENDAR_ID??''):new MockAdapter(options.mockBase??'http://127.0.0.1:4000/mock',clinic,options.mockKey),options.otpSink,options.now);
- const payments=new Payments(engine,options.provider??new RazorpayProvider(process.env.RAZORPAY_KEY_ID??'',process.env.RAZORPAY_KEY_SECRET??''));
+ const provider=options.provider??new RazorpayProvider(process.env.RAZORPAY_KEY_ID??'',process.env.RAZORPAY_KEY_SECRET??'');
+ const payments=new Payments(engine,provider);
  const hash=(s:string)=>createHash('sha256').update(s).digest('hex');
  app.use((req,res,next)=>{res.locals.requestId=randomUUID();res.setHeader('Cache-Control','no-store');res.setHeader('X-Content-Type-Options','nosniff');const origin=req.headers.origin;if(origin){if(!(options.origins??['http://localhost:5173','http://localhost:5174']).includes(origin))return next(new Fault('ORIGIN_NOT_ALLOWED','Origin not allowed',403));res.setHeader('Access-Control-Allow-Origin',origin);res.setHeader('Vary','Origin');res.setHeader('Access-Control-Allow-Headers','Content-Type, Authorization, X-Clinic-Id, X-Session-Id');res.setHeader('Access-Control-Allow-Methods','GET,POST,PATCH,DELETE,OPTIONS');}if(req.method==='OPTIONS'){res.sendStatus(204);return;}next();});
  const limits=new Map<string,{count:number;reset:number}>();app.use((req,res,next)=>{const key=req.socket.remoteAddress??'unknown',now=Date.now();if(limits.size>10000)for(const [k,v] of limits)if(v.reset<now)limits.delete(k);let value=limits.get(key);if(!value||value.reset<now){value={count:0,reset:now+60000};limits.set(key,value);}if(++value.count>120)return next(new Fault('RATE_LIMIT','Try again later',429));next();});
@@ -51,6 +52,16 @@ export function createApp(db:DB,options:{mockBase?:string;mockKey:string;webhook
  const adminAppointment = ({id,reference,doctor_id,service_id,start,end,state}: Record<string,unknown>) => ({id,reference,doctor_id,service_id,start,end,state});
  app.get('/api/admin/appointments',(req,res)=>{const filter=z.object({state:contracts.BookingStatus.optional(),search:z.string().max(100).optional()}).parse(req.query);ok(res,engine.all('SELECT id,reference,doctor_id,service_id,start,end,state FROM appointments WHERE clinic_id=? AND (? IS NULL OR state=?) AND (? IS NULL OR reference LIKE ?) ORDER BY start LIMIT 200',res.locals.clinic,filter.state??null,filter.state??null,filter.search??null,`%${filter.search??''}%`));});
  app.get('/api/admin/overview',(_req,res)=>ok(res,engine.all('SELECT state,COUNT(*) AS count FROM appointments WHERE clinic_id=? GROUP BY state',res.locals.clinic)));
+ app.get('/api/admin/reconciliation',(_req,res)=>ok(res,engine.all(`
+  SELECT j.id,j.kind,j.status,j.attempts,j.next_at AS nextAttemptAt,j.last_error AS reason,a.reference AS bookingReference
+  FROM reconciliation_jobs j LEFT JOIN appointments a ON a.hold_id=j.operation_ref AND a.clinic_id=j.clinic_id
+  WHERE j.clinic_id=? AND j.status<>'DONE' AND (
+   (j.kind='ORDER' AND EXISTS (SELECT 1 FROM payment_order_attempts t WHERE t.hold_id=j.operation_ref AND t.started_at=j.generation))
+   OR (j.kind='CAPTURE' AND EXISTS (SELECT 1 FROM payments p WHERE p.hold_id=j.operation_ref AND p.state IN ('CREATED','FAILED')))
+   OR (j.kind='REFUND' AND EXISTS (SELECT 1 FROM payments p WHERE p.hold_id=j.operation_ref AND p.state='REFUND_PENDING'))
+   OR EXISTS (SELECT 1 FROM booking_operations o WHERE o.booking_key=j.operation_ref AND o.kind=j.kind AND o.started_at=j.generation)
+  ) ORDER BY j.next_at LIMIT 200
+ `,res.locals.clinic)));
  app.get('/api/admin/config',(_req,res)=>ok(res,engine.clinic(res.locals.clinic)));
  const schedule=z.object({days:z.array(z.number().int().min(0).max(6)).min(1),start:z.number().int().min(0).max(23),end:z.number().int().min(1).max(24)}).refine(s=>s.end>s.start);
  const configPatch=z.object({holdSeconds:z.number().int().min(60).max(900).optional(),operatingHours:z.object({start:z.number().int().min(0).max(23),end:z.number().int().min(1).max(24)}).refine(s=>s.end>s.start).optional(),languages:z.array(contracts.language).min(1).optional(),branding:z.object({color:z.string().regex(/^#[0-9a-fA-F]{6}$/)}).optional(),greeting:z.string().max(500).optional(),handoff:z.string().max(100).optional(),emergency:z.string().max(500).optional(),faqs:z.array(z.object({question:z.string().max(300),answer:z.string().max(1000)})).max(50).optional(),refundCutoffHours:z.number().int().min(0).max(720).optional()}).strict();
@@ -85,6 +96,10 @@ export function createApp(db:DB,options:{mockBase?:string;mockKey:string;webhook
  app.post('/api/chat',(_req,_res)=>{throw new Fault('AI_MODULE_NOT_CONNECTED','Nandan must connect the conversational agent using the validated tool interface',501);});
  // Mock clinic management system: real HTTP boundary, state in separate tables.
  app.use('/mock',(req,_res,next)=>{if(!equal(String(req.headers['x-mock-key']??''),options.mockKey))return next(new Fault('MOCK_AUTH_REQUIRED','Mock authentication required',401));next();});
+ app.get('/mock/:clinic/bookings/:id',(req,res)=>{
+  const booking=engine.one('SELECT id,doctor_id AS doctorId,start,end,state FROM mock_bookings WHERE clinic_id=? AND id=?',String(req.params.clinic),String(req.params.id));
+  res.json({booking:booking??null});
+ });
  app.get('/mock/:clinic/busy',(req,res)=>{const p=z.object({doctorId:z.string(),start:z.iso.datetime(),end:z.iso.datetime()}).parse(req.query);res.json(engine.all("SELECT start,end FROM mock_bookings WHERE clinic_id=? AND doctor_id=? AND state!='CANCELLED' AND (state='CONFIRMED' OR expires_at>?) AND start<? AND end>?",String(req.params.clinic),p.doctorId,engine.now(),p.end,p.start));});
  app.post('/mock/:clinic/holds',(req,res)=>{const p=contracts.holdRequest.omit({serviceId:true}).extend({id:z.uuid(),end:z.iso.datetime(),expiresAt:z.iso.datetime()}).parse(req.body);transaction(db,()=>{requireThat(!engine.one("SELECT id FROM mock_bookings WHERE clinic_id=? AND doctor_id=? AND id!=? AND state!='CANCELLED' AND (state='CONFIRMED' OR expires_at>?) AND start<? AND end>?",String(req.params.clinic),p.doctorId,p.id,engine.now(),p.end,p.start),'MOCK_CONFLICT',undefined,409);engine.run('INSERT OR IGNORE INTO mock_bookings VALUES(?,?,?,?,?,?,?)',p.id,String(req.params.clinic),p.doctorId,p.start,p.end,'HELD',Date.parse(p.expiresAt));});res.json({id:p.id});});
  app.post('/mock/:clinic/patients',(req,res)=>{const p=z.object({id:z.uuid(),phone:z.string()}).parse(req.body);engine.run('INSERT OR IGNORE INTO mock_patients VALUES(?,?,?)',p.id,String(req.params.clinic),p.phone);res.json(engine.one('SELECT id FROM mock_patients WHERE clinic_id=? AND phone=?',String(req.params.clinic),p.phone));});
@@ -93,5 +108,5 @@ export function createApp(db:DB,options:{mockBase?:string;mockKey:string;webhook
  app.delete('/mock/:clinic/bookings/:id',(req,res)=>{requireThat(engine.one('SELECT id FROM mock_bookings WHERE id=? AND clinic_id=?',String(req.params.id),String(req.params.clinic)),'MOCK_NOT_FOUND',undefined,404);engine.run("UPDATE mock_bookings SET state='CANCELLED' WHERE id=?",String(req.params.id));res.json({cancelled:true});});
  app.use((_req,_res,next)=>next(new Fault('NOT_FOUND','Endpoint not found',404)));
  app.use((err:unknown,_req:Request,res:Response,_next:NextFunction)=>{const validation=err instanceof z.ZodError;const fault=err instanceof Fault;res.status(validation?400:fault?err.status:500).json({ok:false,error:{code:validation?'VALIDATION_ERROR':fault?err.code:'INTERNAL_ERROR',message:validation?'Invalid request':fault?err.message:'Request could not be completed'},requestId:res.locals.requestId});});
- return {app,engine,payments};
+ return {app,engine,payments,provider};
 }

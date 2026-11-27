@@ -10,6 +10,7 @@ export class MockAdapter implements BookingAdapter {
  async confirmBooking(i:Parameters<BookingAdapter['confirmBooking']>[0]){return (await this.request(`/bookings/${i.id}/confirm`,'POST',i)).id;}
  async rescheduleBooking(id:string,i:Slot & {doctorId:string}){await this.request(`/bookings/${id}`,'PATCH',i);}
  async cancelBooking(id:string){await this.request(`/bookings/${id}`,'DELETE');}
+ async lookupBooking(id:string){return (await this.request(`/bookings/${encodeURIComponent(id)}`)).booking;}
 }
 export class GoogleAdapter implements BookingAdapter {
  constructor(private token:string,private calendar:string){}

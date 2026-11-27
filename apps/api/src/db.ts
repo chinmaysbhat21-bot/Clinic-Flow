@@ -30,6 +30,14 @@ export function openDb(path:string){
   booking_key TEXT PRIMARY KEY REFERENCES holds(id), kind TEXT NOT NULL,
   replacement_id TEXT REFERENCES holds(id), started_at INTEGER NOT NULL
  );
+ CREATE TABLE IF NOT EXISTS reconciliation_jobs(
+  id TEXT PRIMARY KEY, clinic_id TEXT NOT NULL REFERENCES clinics(id),
+  kind TEXT NOT NULL, operation_ref TEXT NOT NULL, generation INTEGER NOT NULL,
+  status TEXT NOT NULL DEFAULT 'PENDING', attempts INTEGER NOT NULL DEFAULT 0,
+  next_at INTEGER NOT NULL, last_error TEXT, lease_until INTEGER, lease_token TEXT,
+  UNIQUE(kind,operation_ref,generation)
+ );
+ CREATE INDEX IF NOT EXISTS reconciliation_due ON reconciliation_jobs(status,next_at,lease_until);
  CREATE TABLE IF NOT EXISTS appointments(id TEXT PRIMARY KEY,reference TEXT UNIQUE NOT NULL,clinic_id TEXT NOT NULL,session_id TEXT NOT NULL,hold_id TEXT UNIQUE NOT NULL,doctor_id TEXT NOT NULL,service_id TEXT NOT NULL,patient_id TEXT NOT NULL,start TEXT NOT NULL,end TEXT NOT NULL,state TEXT NOT NULL,external_id TEXT,created_at INTEGER NOT NULL);
  CREATE INDEX IF NOT EXISTS appointments_overlap ON appointments(doctor_id,start,end,state);
  CREATE TABLE IF NOT EXISTS outbox(id TEXT PRIMARY KEY,clinic_id TEXT NOT NULL,appointment_id TEXT,kind TEXT NOT NULL,destination TEXT,payload TEXT NOT NULL,status TEXT NOT NULL,error TEXT,UNIQUE(appointment_id,kind));

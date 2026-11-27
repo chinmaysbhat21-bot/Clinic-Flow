@@ -11,6 +11,148 @@
     }
   ],
   "paths": {
+    "/api/admin/reconciliation": {
+      "get": {
+        "summary": "List unresolved reconciliation jobs for the authenticated clinic",
+        "x-implementation-status": "IMPLEMENTED AND VERIFIED",
+        "x-owner": "Chinmay",
+        "x-source": "apps/api/src/server.ts:createApp",
+        "security": [
+          {
+            "AdminBearer": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "ok": {
+                      "const": true
+                    },
+                    "data": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "id": {
+                            "type": "string"
+                          },
+                          "kind": {
+                            "enum": [
+                              "ORDER",
+                              "CAPTURE",
+                              "REFUND",
+                              "CONFIRM",
+                              "CANCEL",
+                              "RESCHEDULE"
+                            ]
+                          },
+                          "status": {
+                            "enum": [
+                              "PENDING",
+                              "RUNNING",
+                              "MANUAL"
+                            ]
+                          },
+                          "attempts": {
+                            "type": "integer"
+                          },
+                          "nextAttemptAt": {
+                            "type": "integer",
+                            "description": "Epoch milliseconds"
+                          },
+                          "reason": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ]
+                          },
+                          "bookingReference": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ]
+                          }
+                        },
+                        "required": [
+                          "id",
+                          "kind",
+                          "status",
+                          "attempts",
+                          "nextAttemptAt",
+                          "reason",
+                          "bookingReference"
+                        ]
+                      }
+                    },
+                    "requestId": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "ok",
+                    "data",
+                    "requestId"
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "ADMIN_AUTH_REQUIRED",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "ORIGIN_NOT_ALLOWED",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "RATE_LIMIT",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "INTERNAL_ERROR",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/health": {
       "get": {
         "summary": "SQLite liveness and configuration presence flags",
@@ -6409,6 +6551,126 @@
       }
     },
     "/mock/{clinic}/bookings/{id}": {
+      "get": {
+        "summary": "Read authoritative mock booking state",
+        "x-implementation-status": "IMPLEMENTED AND VERIFIED",
+        "x-owner": "Chinmay",
+        "x-source": "apps/api/src/server.ts:createApp",
+        "security": [
+          {
+            "MockKey": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "booking": {
+                      "anyOf": [
+                        {
+                          "type": "object",
+                          "properties": {
+                            "id": {
+                              "type": "string"
+                            },
+                            "doctorId": {
+                              "type": "string"
+                            },
+                            "start": {
+                              "type": "string"
+                            },
+                            "end": {
+                              "type": "string"
+                            },
+                            "state": {
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "id",
+                            "doctorId",
+                            "start",
+                            "end",
+                            "state"
+                          ]
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    }
+                  },
+                  "required": [
+                    "booking"
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "MOCK_AUTH_REQUIRED",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "ORIGIN_NOT_ALLOWED",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "RATE_LIMIT",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "INTERNAL_ERROR",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "clinic",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ]
+      },
       "patch": {
         "summary": "Update time for confirmed booking after overlap check",
         "description": "Update time for confirmed booking after overlap check. doctorId used for the check.",

@@ -20,6 +20,7 @@ export type BookingState=z.infer<typeof BookingStatus>;
 export type ApiResponse<T>={ok:true;data:T;requestId:string}|{ok:false;error:{code:string;message:string};requestId:string};
 export type Slot={start:string;end:string};
 export interface BookingAdapter {
+ lookupBooking?(id:string):Promise<{id:string;doctorId:string;start:string;end:string;state:string}|null>;
  getSlots(input:{doctorId:string;start:string;end:string}):Promise<Slot[]>;
  holdSlot(input:{id:string;doctorId:string;start:string;end:string;expiresAt:string}):Promise<string>;
  findOrCreatePatient(input:{id:string;phone:string}):Promise<string>;

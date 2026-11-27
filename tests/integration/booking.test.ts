@@ -9,6 +9,7 @@ import { reconcileOffline } from '../../apps/api/src/recovery.js';
 import { configureOtpDelivery } from '../../apps/api/src/otp-delivery.js';
 import { Payments } from '../../apps/api/src/payments.js';
 import { Engine } from '../../apps/api/src/core.js';
+import { ReconciliationWorker } from '../../apps/api/src/reconciliation.js';
 import { expireHolds,openDb,seed,transaction } from '../../apps/api/src/db.js';
 import { createApp } from '../../apps/api/src/server.js';
 import { signature } from '../../apps/api/src/core.js';
@@ -349,5 +350,127 @@ test('admin appointment reads and actions expose only dashboard fields', async (
  } finally {
   await f.close();
  }
+});
+test('reconciliation lease survives restart and fences a delayed worker',async()=>{
+ const directory=mkdtempSync(join(tmpdir(),'clinic-worker-'));
+ const path=join(directory,'clinic.db');
+ try{
+  const f=await fixture(path);
+  try{
+   const hold=await f.verifiedHold();
+   const order={id:'fixture-order',amount:hold.fee,currency:'INR',receipt:hold.id};
+   f.provider.order=async()=>{throw new Error('Lost order response');};
+   await assert.rejects(f.payments.order('lotus',f.session,hold.id));
+   const entered=signal(),release=signal();
+   let lookups=0;
+   const provider:PaymentProvider={...f.provider,findOrder:async()=>{
+    if(++lookups===1){entered.resolve();await release.promise;}
+    return order;
+   }};
+   const options={graceMs:0,leaseMs:100,maxAttempts:3};
+   const first=new ReconciliationWorker(f.engine,f.payments,provider,options);
+   const old=first.runOnce();
+   await entered.promise;
+   const secondDb=openDb(path);
+   try{
+    const engine=new Engine(secondDb,f.engine.adapters,undefined,f.engine.now);
+    const restart=new ReconciliationWorker(engine,new Payments(engine,provider),provider,options);
+    assert.equal(await restart.runOnce(),false);
+    f.advance(101);
+    assert.equal(await restart.runOnce(),true);
+    assert.equal(engine.one('SELECT COUNT(*) count FROM reconciliation_jobs')?.count,1);
+    assert.equal(engine.one('SELECT status,attempts FROM reconciliation_jobs')?.attempts,2);
+    assert.equal(engine.one('SELECT status FROM reconciliation_jobs')?.status,'DONE');
+   }finally{secondDb.close();release.resolve();await old;}
+   assert.equal(f.engine.one('SELECT COUNT(*) count FROM payments')?.count,1);
+   assert.equal(f.engine.one('SELECT COUNT(*) count FROM payment_order_attempts')?.count,0);
+  }finally{await f.close();}
+ }finally{rmSync(directory,{recursive:true});}
+});
+
+test('worker backs off, escalates and exposes only clinic-scoped job metadata',async()=>{
+ const f=await fixture();
+ try{
+  const hold=await f.verifiedHold();
+  const payment=await f.pay(hold.id);
+  const provider:PaymentProvider={...f.provider,findCapturedPayment:async()=>null};
+  const worker=new ReconciliationWorker(f.engine,f.payments,provider,{graceMs:0,retryMs:100,maxAttempts:2});
+  assert.equal(await worker.runOnce(),true);
+  assert.equal(await worker.runOnce(),false);
+  f.advance(100);
+  assert.equal(await worker.runOnce(),true);
+  assert.equal(f.engine.one('SELECT status FROM reconciliation_jobs')?.status,'MANUAL');
+  for(const clinic of ['lotus','harbor']){
+   const admin=await f.request('/api/admin/login','POST',{email:clinic+'@demo.invalid',password:'test-password-123'});
+   const response=await f.request('/api/admin/reconciliation','GET',undefined,undefined,clinic,admin.data.token);
+   assert.equal(response.data.length,clinic==='lotus'?1:0);
+   if(clinic==='lotus')assert.deepEqual(Object.keys(response.data[0]).sort(),['attempts','bookingReference','id','kind','nextAttemptAt','reason','status'].sort());
+  }
+  const captureProvider:PaymentProvider={...provider,findCapturedPayment:async()=>payment.body.razorpay_payment_id};
+  f.advance(301000);
+  // Operator requeues the job after receiving capture evidence.
+  f.engine.run("UPDATE reconciliation_jobs SET status='PENDING',attempts=0,next_at=?",f.engine.now());
+  const capture=new ReconciliationWorker(f.engine,f.payments,captureProvider,{graceMs:0});
+  assert.equal(await capture.runOnce(),true);
+  assert.equal(f.engine.one('SELECT state FROM payments WHERE hold_id=?',hold.id)?.state,'REFUND_PENDING');
+  assert.equal(await capture.runOnce(),true);
+  assert.equal(f.engine.one("SELECT status FROM reconciliation_jobs WHERE kind='REFUND'")?.status,'MANUAL');
+ }finally{await f.close();}
+});
+
+test('provider evidence recovers confirmation, expired replacement and cancellation without replay',async()=>{
+ const f=await fixture();
+ try{
+  const hold=await f.verifiedHold();
+  await (await f.pay(hold.id)).verify();
+  const adapter=f.engine.adapters('lotus');
+  f.engine.adapters=()=>adapter;
+  const confirm=adapter.confirmBooking.bind(adapter);
+  const move=adapter.rescheduleBooking.bind(adapter);
+  const cancel=adapter.cancelBooking.bind(adapter);
+  adapter.confirmBooking=async input=>{await confirm(input);throw new Error('Lost confirmation response');};
+  adapter.rescheduleBooking=async (...args)=>{await move(...args);throw new Error('Lost move response');};
+  adapter.cancelBooking=async id=>{await cancel(id);throw new Error('Lost cancellation response');};
+  const worker=new ReconciliationWorker(f.engine,f.payments,f.provider,{graceMs:0});
+  await assert.rejects(f.engine.confirm('lotus',f.session,hold.id),{code:'CONFIRMATION_PENDING'});
+  assert.equal(await worker.runOnce(),true);
+  const appointment=await f.engine.confirm('lotus',f.session,hold.id);
+  assert.equal(appointment.state,'CONFIRMED');
+  const replacementInput={...f.input,start:'2026-12-04T03:30:00.000Z'};
+  const replacement=await f.engine.reserve('lotus',f.session,replacementInput);
+  await assert.rejects(f.engine.reschedule('lotus',f.session,appointment.id,replacement.id),{code:'RESCHEDULE_PENDING'});
+  f.advance(86400001);
+  transaction(f.db,()=>expireHolds(f.db,f.engine.now()));
+  assert.equal(f.engine.slots('lotus',f.input.doctorId,f.input.serviceId,'2026-12-04').some(s=>s.start===replacementInput.start),false);
+  assert.equal(await worker.runOnce(),true);
+  assert.equal(f.engine.booking('lotus',f.session,appointment.id).start,replacementInput.start);
+  assert.equal(f.engine.hold('lotus',f.session,replacement.id,false).state,'CONFIRMED');
+  await assert.rejects(f.engine.cancel('lotus',f.session,appointment.id),/Lost cancellation response/);
+  assert.equal(await worker.runOnce(),true);
+  assert.equal((await f.engine.cancel('lotus',f.session,appointment.id)).state,'REFUND_PENDING');
+  assert.equal(f.engine.one('SELECT COUNT(*) count FROM booking_operations')?.count,0);
+ }finally{await f.close();}
+});
+
+test('an inconclusive move remains quarantined after hold expiry and manual escalation',async()=>{
+ const f=await fixture();
+ try{
+  const hold=await f.verifiedHold();
+  await (await f.pay(hold.id)).verify();
+  const appointment=await f.engine.confirm('lotus',f.session,hold.id);
+  const target={...f.input,start:'2026-12-04T03:30:00.000Z'};
+  const replacement=await f.engine.reserve('lotus',f.session,target);
+  const adapter=f.engine.adapters('lotus');
+  adapter.rescheduleBooking=async()=>{throw new Error('Unknown provider outcome');};
+  f.engine.adapters=()=>adapter;
+  await assert.rejects(f.engine.reschedule('lotus',f.session,appointment.id,replacement.id),{code:'RESCHEDULE_PENDING'});
+  f.advance(86400001);
+  const worker=new ReconciliationWorker(f.engine,f.payments,f.provider,{graceMs:0,maxAttempts:1});
+  assert.equal(await worker.runOnce(),true);
+  assert.equal(f.engine.one("SELECT status FROM reconciliation_jobs WHERE kind='RESCHEDULE'")?.status,'MANUAL');
+  assert.equal(f.engine.booking('lotus',f.session,appointment.id).start,appointment.start);
+  assert.equal(f.engine.one('SELECT replacement_id FROM booking_operations')?.replacement_id,replacement.id);
+  await assert.rejects(f.engine.reserve('lotus',f.session,target),{code:'SLOT_UNAVAILABLE'});
+ }finally{await f.close();}
 });
 test('Google adapter fails closed without credentials',async()=>{await assert.rejects(()=>new GoogleAdapter('','').getSlots({doctorId:'x',start:'2026-12-01T00:00:00Z',end:'2026-12-02T00:00:00Z'}),/Google Calendar credentials/);});
