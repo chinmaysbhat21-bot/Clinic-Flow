@@ -2,8 +2,8 @@
 
 :root {
   font-family: 'Inter Tight', 'Segoe UI', sans-serif;
-  color: #3f3f46;
-  background: #ffffff;
+  color: #292722;
+  background: #fbf8f1;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
@@ -15,6 +15,6 @@ html { min-width: 320px; scroll-behavior: smooth; }
 body { min-width: 320px; min-height: 100vh; margin: 0; }
 button, input, select { font: inherit; }
 button, a, select, input { -webkit-tap-highlight-color: transparent; }
-button:focus-visible, a:focus-visible, select:focus-visible, input:focus-visible { outline: 3px solid #3730a3; outline-offset: 4px; }
+button:focus-visible, a:focus-visible, select:focus-visible, input:focus-visible { outline: 3px solid #171614; outline-offset: 4px; }
 a { color: inherit; }
-::selection { background: #3730a3; color: #ffffff; }
+::selection { background: #171614; color: #f4efe5; }

@@ -19,6 +19,27 @@ export type Service = { id: string; clinic_id: string; name: string; duration: n
 export type ApiSlot = { start: string; end: string }
 export type SlotHold = { id: string; start: string; end: string; fee: number; expires_at: number; state: string }
 export type PatientContext = { clinicId: string; sessionId: string }
+export type ChatLanguage = 'en' | 'kn' | 'hi'
+export type ChatAction =
+  | { type: 'SELECT_SLOT'; slots: Array<{ start: string; end: string }> }
+  | { type: 'VERIFY_OTP'; holdId: string }
+  | { type: 'PAY'; holdId: string; orderId: string; amount: number; currency: 'INR'; keyId: string }
+  | { type: 'CONFIRMED'; bookingId: string; reference: string }
+  | { type: 'HANDOFF'; contact: string }
+export type ChatReply = { message: string; language: ChatLanguage; actions: ChatAction[] }
+export type PaymentOrder = { keyId: string; orderId: string; amount: number; currency: 'INR' }
+export type PaymentVerification = { state: 'PAYMENT_VERIFIED' | 'VERIFIED' | 'REFUND_PENDING' | 'REFUNDED' | 'FAILED' }
+export type AppointmentBooking = {
+  id: string
+  reference: string
+  doctor_id: string
+  service_id: string
+  start: string
+  end: string
+  state: string
+  fee: number | null
+  duration: number | null
+}
 
 const configuredBaseUrl = import.meta.env.VITE_API_BASE_URL?.trim().replace(/\/+$/, '') || ''
 export const hasLiveApi = Boolean(configuredBaseUrl)
@@ -76,6 +97,9 @@ export const clinicApi = {
   createSession(clinicId: string, signal?: AbortSignal) {
     return request<PatientSession>('/api/sessions', { method: 'POST', body: { clinicId }, signal })
   },
+  sendChatMessage(context: PatientContext, message: string, language: ChatLanguage, signal?: AbortSignal) {
+    return request<ChatReply>('/api/chat', { method: 'POST', context, body: { message, language }, signal })
+  },
   getClinic(id: string, context: PatientContext, signal?: AbortSignal) {
     return request<ClinicConfig>(`/api/clinics/${encodeURIComponent(id)}/config`, { context, signal })
   },
@@ -103,5 +127,31 @@ export const clinicApi = {
   },
   verifyOtp(context: PatientContext, holdId: string, phone: string, code: string) {
     return request<{ state: 'OTP_VERIFIED' }>('/api/otp/verify', { method: 'POST', context, body: { holdId, phone, code } })
+  },
+  createPaymentOrder(context: PatientContext, holdId: string) {
+    return request<PaymentOrder>('/api/payments/order', { method: 'POST', context, body: { holdId } })
+  },
+  verifyPayment(context: PatientContext, input: { holdId: string; razorpay_order_id: string; razorpay_payment_id: string; razorpay_signature: string }) {
+    return request<PaymentVerification>('/api/payments/verify', { method: 'POST', context, body: input })
+  },
+  confirmBooking(context: PatientContext, holdId: string) {
+    return request<AppointmentBooking>('/api/bookings/confirm', { method: 'POST', context, body: { holdId } })
+  },
+  async downloadCalendar(context: PatientContext, bookingId: string) {
+    if (!configuredBaseUrl) throw new Error('VITE_API_BASE_URL is not configured.')
+    let response: Response
+    try {
+      response = await fetch(`${configuredBaseUrl}/api/bookings/${encodeURIComponent(bookingId)}/calendar.ics`, {
+        headers: { Accept: 'text/calendar', 'X-Clinic-Id': context.clinicId, 'X-Session-Id': context.sessionId },
+        credentials: 'omit',
+      })
+    } catch {
+      throw new ApiError(0, 'NETWORK_ERROR', 'The clinic service could not be reached. Check that it is running and try again.')
+    }
+    if (!response.ok) {
+      const payload = await response.json().catch(() => null) as { error?: { code?: string; message?: string }; requestId?: string } | null
+      throw new ApiError(response.status, payload?.error?.code || 'REQUEST_FAILED', payload?.error?.message || 'The calendar invitation could not be downloaded.', payload?.requestId)
+    }
+    return response.blob()
   },
 }

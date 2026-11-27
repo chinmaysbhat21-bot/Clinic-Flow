@@ -1,0 +1,45 @@
+.clinic-chat-widget { --chat-ink: #171614; --chat-paper: #fbf8f1; --chat-muted: #686257; --chat-line: #ded8cd; --chat-panel: #fffefa; position: fixed; z-index: 1000; right: 28px; bottom: 24px; font-family: 'Inter Tight', 'Segoe UI', sans-serif; color: var(--chat-ink); }
+.clinic-chat-launcher { min-height: 58px; display: inline-flex; align-items: center; justify-content: center; gap: 11px; padding: 0 20px; border: 1px solid var(--chat-ink); border-radius: 999px; background: var(--chat-ink); color: #fffefa; box-shadow: 0 8px 28px rgb(23 22 20 / 18%); font-size: 17px; font-weight: 750; cursor: pointer; transition: transform .16s ease, background .16s ease; }
+.clinic-chat-launcher:hover { transform: translateY(-2px); background: #35322d; }
+.clinic-chat-launcher.is-open { width: 58px; padding: 0; }
+.clinic-chat-launcher-extra { margin-left: 3px; }
+.clinic-chat-panel { position: absolute; right: 0; bottom: 74px; width: min(420px, calc(100vw - 40px)); height: min(640px, calc(100dvh - 112px)); min-height: 420px; display: flex; flex-direction: column; overflow: hidden; border: 1px solid var(--chat-line); border-radius: 19px; background: var(--chat-panel); box-shadow: 0 20px 70px rgb(23 22 20 / 20%); }
+.clinic-chat-header { min-height: 76px; display: flex; align-items: center; gap: 12px; padding: 12px 14px; border-bottom: 1px solid var(--chat-line); background: var(--chat-paper); }
+.clinic-chat-logo { width: 42px; height: 42px; flex: 0 0 42px; border-radius: 13px; object-fit: cover; }
+.clinic-chat-heading { display: grid; gap: 4px; min-width: 0; flex: 1; }
+.clinic-chat-heading strong { overflow: hidden; color: var(--chat-ink); font-size: 18px; font-weight: 800; text-overflow: ellipsis; white-space: nowrap; }
+.clinic-chat-heading span { display: flex; align-items: center; gap: 7px; color: var(--chat-muted); font-size: 14px; font-weight: 600; }
+.clinic-chat-heading i { width: 9px; height: 9px; border-radius: 50%; background: #368064; }
+.clinic-chat-language select { min-height: 40px; padding: 0 8px; border: 1px solid var(--chat-line); border-radius: 9px; background: #fffefa; color: var(--chat-ink); font-size: 14px; font-weight: 700; }
+.clinic-chat-close { width: 42px; height: 42px; display: grid; place-items: center; border: 0; border-radius: 10px; background: transparent; color: var(--chat-ink); cursor: pointer; }
+.clinic-chat-close:hover { background: #eee9df; }
+.clinic-chat-messages { flex: 1; display: flex; flex-direction: column; align-items: flex-start; gap: 13px; overflow-y: auto; padding: 20px 16px; scroll-behavior: smooth; }
+.clinic-chat-message { max-width: 88%; padding: 13px 15px; border: 1px solid var(--chat-line); border-radius: 15px 15px 15px 4px; background: #fff; color: #292722; font-size: 16px; font-weight: 550; line-height: 1.5; white-space: pre-line; overflow-wrap: anywhere; }
+.clinic-chat-message p { margin: 0; }
+.clinic-chat-message.visitor { align-self: flex-end; border-color: var(--chat-ink); border-radius: 15px 15px 4px 15px; background: var(--chat-ink); color: #fffefa; }
+.clinic-chat-message.assistant { align-self: flex-start; }
+.clinic-chat-message.clinic-chat-loading { display: flex; align-items: center; gap: 9px; color: var(--chat-muted); }
+.clinic-chat-spinner { animation: clinic-chat-rotate 1s linear infinite; }
+.clinic-chat-confirmed { display: flex; align-items: center; gap: 6px; margin-top: 8px; color: #286348; font-size: 13px; font-weight: 750; }
+.clinic-chat-error { align-self: stretch; padding: 12px; border: 1px solid #a54331; border-radius: 11px; background: #fff6f2; color: #762b1e; font-size: 14px; font-weight: 650; line-height: 1.45; }
+.clinic-chat-error p { margin: 0 0 8px; }
+.clinic-chat-error button { min-height: 40px; padding: 0 12px; border: 1px solid currentColor; border-radius: 8px; background: transparent; color: inherit; font-weight: 750; cursor: pointer; }
+.clinic-chat-booking { display: grid; grid-template-columns: 20px 1fr; gap: 5px 8px; padding: 12px 15px; border-top: 1px solid var(--chat-line); background: var(--chat-paper); color: var(--chat-muted); font-size: 13px; font-weight: 600; line-height: 1.4; }
+.clinic-chat-booking svg { grid-row: span 2; margin-top: 2px; }
+.clinic-chat-booking a { color: var(--chat-ink); font-size: 14px; font-weight: 800; text-underline-offset: 3px; }
+.clinic-chat-compose { display: flex; align-items: flex-end; gap: 9px; padding: 12px 14px 5px; }
+.clinic-chat-compose textarea { width: 100%; min-height: 48px; max-height: 112px; resize: vertical; padding: 12px 13px; border: 1px solid #bcb5a8; border-radius: 12px; background: #fff; color: var(--chat-ink); font-size: 16px; font-weight: 550; line-height: 1.4; }
+.clinic-chat-compose textarea::placeholder { color: #686257; opacity: 1; }
+.clinic-chat-compose button { width: 48px; height: 48px; display: grid; place-items: center; flex: 0 0 48px; border: 1px solid var(--chat-ink); border-radius: 12px; background: var(--chat-ink); color: #fffefa; cursor: pointer; }
+.clinic-chat-compose button:disabled { border-color: #c9c3b9; background: #dedbd5; color: #6e6a62; cursor: not-allowed; }
+.clinic-chat-hint { margin: 0; padding: 0 15px 9px; color: var(--chat-muted); font-size: 12px; font-weight: 550; text-align: right; }
+.clinic-chat-widget button:focus-visible, .clinic-chat-widget select:focus-visible, .clinic-chat-widget textarea:focus-visible, .clinic-chat-widget a:focus-visible { outline: 3px solid #78684d; outline-offset: 3px; }
+.sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; clip-path: inset(50%); }
+@keyframes clinic-chat-rotate { to { transform: rotate(360deg); } }
+@media (max-width: 520px) {
+  .clinic-chat-widget { right: 14px; bottom: 14px; }
+  .clinic-chat-launcher { min-height: 56px; padding: 0 17px; }
+  .clinic-chat-panel { position: fixed; inset: 8px; width: auto; height: auto; min-height: 0; border-radius: 16px; }
+  .clinic-chat-message { max-width: 92%; font-size: 16px; }
+}
+@media (prefers-reduced-motion: reduce) { .clinic-chat-widget *, .clinic-chat-widget *::before, .clinic-chat-widget *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; transition-duration: .01ms !important; } }
