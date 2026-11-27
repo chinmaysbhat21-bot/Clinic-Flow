@@ -7,11 +7,12 @@ import { createApp } from '../../apps/api/src/server.js';
 import { signature } from '../../apps/api/src/core.js';
 import { GoogleAdapter } from '../../apps/api/src/adapters.js';
 import type { PaymentProvider } from '../../apps/api/src/payments.js';
+import type { IntentExtractor } from '../../packages/ai-agent/src/index.js';
 
-async function fixture(){
+async function fixture(intentExtractor?:IntentExtractor,briefingDestination?:string){
  const db=openDb(':memory:');seed(db,'test-password-123');let now=Date.parse('2026-12-01T00:00:00Z');const codes=new Map<string,string>();const orders=new Map<string,number>();const captured=new Map<string,{order:string;amount:number}>();
  const provider:PaymentProvider={keyId:'rzp_test_fixture',secret:'fixture-secret',async order(amount){const id=randomUUID();orders.set(id,amount);return {id,amount,currency:'INR'};},async payment(id){const p=captured.get(id)!;return {id,order_id:p.order,amount:p.amount,currency:'INR',status:'captured'};}};
- const state=createApp(db,{mockKey:'fixture-only-key',provider,now:()=>now,otpSink:(id,code)=>codes.set(id,code)});
+ const state=createApp(db,{mockKey:'fixture-only-key',provider,now:()=>now,otpSink:(id,code)=>codes.set(id,code),intentExtractor,briefingDestination});
  const server=state.app.listen(0,'127.0.0.1');await once(server,'listening');const addr=server.address() as {port:number};const base=`http://127.0.0.1:${addr.port}`;
  // Redirect mock adapter to this ephemeral HTTP server.
  const { MockAdapter }=await import('../../apps/api/src/adapters.js');const original=state.engine.adapters;state.engine.adapters=c=>c==='lotus'?new MockAdapter(`${base}/mock`,c,'fixture-only-key'):original(c);
@@ -24,6 +25,33 @@ async function fixture(){
  async function pay(id:string){const r=await request('/api/payments/order','POST',{holdId:id},session);assert.equal(r.status,200,JSON.stringify(r));const order=r.data;const paymentId=randomUUID();captured.set(paymentId,{order:order.orderId,amount:order.amount});const body={holdId:id,razorpay_order_id:order.orderId,razorpay_payment_id:paymentId,razorpay_signature:signature(provider.secret,`${order.orderId}|${paymentId}`)};return {body,verify:()=>request('/api/payments/verify','POST',body,session)};}
  return {...state,db,request,session,codes,input,consent,reserve,verifiedHold,pay,advance:(ms:number)=>{now+=ms;},close:async()=>{server.closeAllConnections();await new Promise<void>(r=>server.close(()=>r()));db.close();}};
 }
+test('chat returns localized structured actions based on backend catalog and availability',async()=>{const extractor:IntentExtractor={async extract(){return {intent:'book_appointment',service:'Consultation',doctor:'Dr Demo Meera',specialization:null,preferredDate:'2026-12-01',timePreference:'morning',bookingId:null,faqTopic:null,patientReportedConcern:null};}};const f=await fixture(extractor);try{const available=await f.request('/api/slots?doctorId=lotus-doctor&serviceId=lotus-consult&date=2026-12-01','GET',undefined,f.session);const chat=await f.request('/api/chat','POST',{message:'Book a consultation with Dr Demo Meera tomorrow morning',language:'en'},f.session);assert.equal(chat.status,200,JSON.stringify(chat));assert.equal(chat.data.language,'en');assert.equal(chat.data.actions[0].type,'SELECT_SLOT');assert.deepEqual(chat.data.actions[0].slots,available.data.filter((slot:{start:string})=>{const hour=new Date(new Date(slot.start).getTime()+19800000).getUTCHours();return hour>=5&&hour<12;}));assert.equal(chat.data.state,undefined);}finally{await f.close();}});
+test('fictional chat booking smoke flow uses backend availability through confirmation',async()=>{
+ const extractor:IntentExtractor={async extract(){return {intent:'book_appointment',service:'Consultation',doctor:'Dr Demo Meera',specialization:null,preferredDate:'2026-12-01',timePreference:'morning',bookingId:null,faqTopic:null,patientReportedConcern:null};}};
+ const f=await fixture(extractor);
+ try{
+  const chat=await f.request('/api/chat','POST',{message:'Book a consultation with Dr Demo Meera tomorrow morning',language:'en'},f.session);
+  assert.equal(chat.status,200,JSON.stringify(chat));
+  const action=chat.data.actions[0];
+  assert.equal(action.type,'SELECT_SLOT');
+  const selected=action.slots[0];
+  assert.ok(selected);
+  await f.consent();
+  const holdResponse=await f.request('/api/holds','POST',{doctorId:'lotus-doctor',serviceId:'lotus-consult',start:selected.start},f.session);
+  assert.equal(holdResponse.status,201,JSON.stringify(holdResponse));
+  const hold=holdResponse.data;
+  await f.request('/api/otp/send','POST',{holdId:hold.id,phone:'+919999999999'},f.session);
+  const otp=await f.request('/api/otp/verify','POST',{holdId:hold.id,phone:'+919999999999',code:f.codes.get(hold.id)},f.session);
+  assert.equal(otp.status,200,JSON.stringify(otp));
+  const payment=await f.pay(hold.id);
+  assert.equal((await payment.verify()).status,200);
+  const confirmed=await f.request('/api/bookings/confirm','POST',{holdId:hold.id},f.session);
+  assert.equal(confirmed.status,200,JSON.stringify(confirmed));
+  assert.equal(confirmed.data.state,'CONFIRMED');
+  assert.equal(confirmed.data.start,selected.start);
+ }finally{await f.close();}
+});
+test('chat briefing is stored only with backend consent and a confirmed booking',async()=>{const extractor:IntentExtractor={async extract(){return {intent:'other',service:null,doctor:null,specialization:null,preferredDate:null,timePreference:null,bookingId:null,faqTopic:null,patientReportedConcern:'Patient reports tooth pain for three days.'};}};const f=await fixture(extractor,'doctor@example.invalid');try{const first=await f.request('/api/chat','POST',{message:'My tooth has hurt for three days',language:'en'},f.session);assert.equal(first.data.briefingCandidate,undefined);assert.equal(f.engine.all('SELECT * FROM briefings').length,0);const hold=await f.verifiedHold(),payment=await f.pay(hold.id);await payment.verify();await f.request('/api/bookings/confirm','POST',{holdId:hold.id},f.session);const second=await f.request('/api/chat','POST',{message:'Please include my concern',language:'en'},f.session);assert.equal(second.data.briefingCandidate,undefined);const saved=f.engine.one('SELECT summary FROM briefings WHERE clinic_id=?','lotus');assert.ok(saved);assert.match(saved.summary,/Patient reports tooth pain for three days/);assert.match(saved.summary,/not a medical diagnosis/);assert.equal(f.engine.all("SELECT * FROM outbox WHERE kind='BRIEFING'").length,1);}finally{await f.close();}});
 test('SQLite health, consent, clinic isolation and admin authorization',async()=>{const f=await fixture();try{assert.equal((await f.request('/api/health')).data.database,'sqlite');assert.equal((await f.reserve()).error.code,'CONSENT_REQUIRED');assert.equal((await f.request('/api/admin/appointments')).status,401);await f.consent();assert.equal((await f.request('/api/slots?doctorId=harbor-doctor&serviceId=lotus-consult&date=2026-12-01','GET',undefined,f.session)).error.code,'INVALID_SELECTION');assert.equal((await f.request('/api/slots?doctorId=lotus-doctor&serviceId=lotus-consult&date=2026-12-01','GET',undefined,f.session,'harbor')).status,401);}finally{await f.close();}});
 test('concurrent HTTP holds have exactly one winner and expiry releases capacity',async()=>{const f=await fixture();try{await f.consent();const results=await Promise.all(Array.from({length:8},()=>f.reserve()));assert.equal(results.filter(r=>r.status===201).length,1);assert.equal(results.filter(r=>r.status===409).length,7);f.advance(301000);assert.equal((await f.reserve()).status,201);}finally{await f.close();}});
 test('OTP rejects invalid code, enforces retry limit, cooldown and single consumption',async()=>{const f=await fixture();try{await f.consent();const h=(await f.reserve()).data;const input={holdId:h.id,phone:'+919999999999'};const sent=await f.request('/api/otp/send','POST',input,f.session);assert.equal(sent.data.code,undefined);assert.equal((await f.request('/api/otp/send','POST',input,f.session)).status,429);for(let i=0;i<5;i++)assert.equal((await f.request('/api/otp/verify','POST',{...input,code:'000000'},f.session)).status,400);assert.equal((await f.request('/api/otp/verify','POST',{...input,code:f.codes.get(h.id)},f.session)).status,400);}finally{await f.close();}});

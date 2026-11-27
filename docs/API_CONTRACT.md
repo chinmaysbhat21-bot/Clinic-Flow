@@ -29,7 +29,7 @@ Base URL is `http://127.0.0.1:4000`. Send `Content-Type: application/json` for J
 | `POST /api/bookings/{id}/reschedule` | patient | BLOCKED |
 | `GET /api/bookings/{id}/calendar.ics` | patient | IMPLEMENTED BUT UNVERIFIED |
 | `POST /api/bookings/{id}/briefing` | patient | PARTIALLY IMPLEMENTED |
-| `POST /api/chat` | patient | BLOCKED |
+| `POST /api/chat` | patient | IMPLEMENTED; mock-extractor integration-tested and one minimal Gemini API request verified; full live booking unverified |
 | `POST /api/admin/login` | public | IMPLEMENTED AND VERIFIED |
 | `GET /api/admin/appointments` | admin | IMPLEMENTED AND VERIFIED |
 | `GET /api/admin/overview` | admin | IMPLEMENTED BUT UNVERIFIED |
@@ -67,8 +67,8 @@ Base URL is `http://127.0.0.1:4000`. Send `Content-Type: application/json` for J
 | AvailabilitySlot, SlotHold | Shared `Slot` and hold request. Hold response projection uses id, start, end, fee in paise, expires_at in milliseconds, state. |
 | PaymentOrder, PaymentStatus | Inline checkout response with keyId, orderId, amount and INR. Shared PaymentStatus enum. Verification response mixes booking and payment states. |
 | Appointment, AppointmentStatus, RefundStatus | Shared BookingStatus combines multiple lifecycle concepts. No independent runtime refund status schema. Project appointment fields explicitly. |
-| ChatRequest, ChatResponse | PROPOSED in [AI tool contract](AI_TOOL_CONTRACT.md). |
-| ChatAction | Existing shared five-way discriminated union; no active HTTP producer. |
+| ChatRequest, ChatResponse | `{message,language}` input and `{message,language,actions}` output, implemented in [AI tool contract](AI_TOOL_CONTRACT.md). Agent state stays server-side. |
+| ChatAction | Existing shared five-way discriminated union; chat route validates every emitted action against it. |
 | ToolRequest, ToolResponse | Existing name-to-Zod argument map and trusted context. No uniform result validator. |
 | PatientBriefing | Shared request accepts a patient-reported summary of 1–2000 characters; response only acknowledges simulation. |
 | APIError | Shared TypeScript ApiResponse union; current error schema in OpenAPI. No shared runtime response validators. |
@@ -79,7 +79,7 @@ Base URL is `http://127.0.0.1:4000`. Send `Content-Type: application/json` for J
 
 ## Proposed or missing capabilities
 
-No standalone readiness endpoint, session refresh/revoke, admin appointment details, refund execution or reconciliation endpoint, delivery-status workflow, or separate OTP resend endpoint exists. Resend uses the existing OTP send route. For admin details, a proposed `GET /api/admin/appointments/{id}` would return a clinic-scoped appointment projection or 404. A proposed readiness probe would report dependency readiness separately from liveness. Refund reconciliation should begin as a backend operation with provider confirmation and audit events. Chat input and output are proposed separately. None of these proposals changes the current OpenAPI paths.
+No standalone readiness endpoint, session refresh/revoke, admin appointment details, refund execution or reconciliation endpoint, delivery-status workflow, or separate OTP resend endpoint exists. Resend uses the existing OTP send route. For admin details, a proposed `GET /api/admin/appointments/{id}` would return a clinic-scoped appointment projection or 404. A proposed readiness probe would report dependency readiness separately from liveness. Refund reconciliation should begin as a backend operation with provider confirmation and audit events. Conversation state for `/api/chat` currently lives in a bounded in-memory map scoped to clinic and session. It expires after 24 hours and is lost on restart; multi-process deployment needs shared persistence. Gemini configuration is server-side through `LLM_PROVIDER=gemini`, `GEMINI_API_KEY`, and optional `GEMINI_MODEL`.
 
 ## Versioning
 

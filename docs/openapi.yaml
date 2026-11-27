@@ -3072,10 +3072,10 @@
     },
     "/api/chat": {
       "post": {
-        "summary": "Authenticated stub always returns AI_MODULE_NOT_CONNECTED",
-        "description": "Authenticated stub always returns AI_MODULE_NOT_CONNECTED. No implemented request or success model.",
-        "x-implementation-status": "BLOCKED",
-        "x-owner": "Chinmay",
+        "summary": "Authenticated multilingual conversational assistant",
+        "description": "Runs intent extraction with Gemini and validated server-side tools. Requires server-side LLM_PROVIDER=gemini and GEMINI_API_KEY. Agent state is process-local and session-scoped.",
+        "x-implementation-status": "IMPLEMENTED; one minimal Gemini request verified; full live booking unverified",
+        "x-owner": "Nandan",
         "x-source": "apps/api/src/server.ts:createApp",
         "security": [
           {
@@ -3083,7 +3083,32 @@
             "PatientSession": []
           }
         ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/ChatRequest" },
+              "example": { "message": "I need a dental consultation tomorrow morning.", "language": "en" }
+            }
+          }
+        },
         "responses": {
+          "200": {
+            "description": "Assistant message and validated widget actions",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "ok": { "const": true },
+                    "data": { "$ref": "#/components/schemas/ChatResponse" },
+                    "requestId": { "type": "string" }
+                  },
+                  "required": ["ok", "data", "requestId"]
+                }
+              }
+            }
+          },
           "401": {
             "description": "SESSION_REQUIRED",
             "content": {
@@ -7031,6 +7056,64 @@
           "emergency",
           "faqs",
           "refundCutoffHours"
+        ]
+      },
+      "ChatRequest": {
+        "type": "object",
+        "properties": {
+          "message": { "type": "string", "minLength": 1, "maxLength": 4000 },
+          "language": { "type": "string", "enum": ["en", "kn", "hi"] }
+        },
+        "required": ["message", "language"],
+        "additionalProperties": false
+      },
+      "ChatResponse": {
+        "type": "object",
+        "properties": {
+          "message": { "type": "string" },
+          "language": { "type": "string", "enum": ["en", "kn", "hi"] },
+          "actions": { "type": "array", "items": { "$ref": "#/components/schemas/ChatAction" } }
+        },
+        "required": ["message", "language", "actions"]
+      },
+      "ChatAction": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "type": { "const": "SELECT_SLOT" },
+              "slots": { "type": "array", "items": { "$ref": "#/components/schemas/Slot" } }
+            },
+            "required": ["type", "slots"],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": { "type": { "const": "VERIFY_OTP" }, "holdId": { "type": "string" } },
+            "required": ["type", "holdId"],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "type": { "const": "PAY" }, "holdId": { "type": "string" }, "orderId": { "type": "string" },
+              "amount": { "type": "integer" }, "currency": { "const": "INR" }, "keyId": { "type": "string" }
+            },
+            "required": ["type", "holdId", "orderId", "amount", "currency", "keyId"],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": { "type": { "const": "CONFIRMED" }, "bookingId": { "type": "string" }, "reference": { "type": "string" } },
+            "required": ["type", "bookingId", "reference"],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": { "type": { "const": "HANDOFF" }, "contact": { "type": "string" } },
+            "required": ["type", "contact"],
+            "additionalProperties": false
+          }
         ]
       }
     },

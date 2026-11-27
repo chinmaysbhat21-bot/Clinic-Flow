@@ -3,7 +3,7 @@
 | Owner | Step | Current evidence or blocker |
 |---|---|---|
 | Jay | Open widget → POST /api/sessions → persist credential and expiry | In-memory integration fixture passes |
-| Nandan | Receive request → POST /api/chat → structured actions | 501; connect approved orchestration |
+| Nandan | Receive request → POST /api/chat → structured actions | Route integrated with `executeTool`; mock-extractor integration test passes; configure and verify live LLM key |
 | Nandan and Jay | Use discovery and getSlots or GET /api/slots | Mock availability tested; Google credentials needed |
 | Jay | Choose returned time → POST /api/consent → POST /api/holds | Consent and lock tested; countdown uses expires_at |
 | Jay and Chinmay | POST /api/otp/send then /verify | Backend fixture passes; debugger-only delivery |

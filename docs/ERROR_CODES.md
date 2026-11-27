@@ -5,7 +5,7 @@ Actual format is `{ok:false,error:{code,message},requestId}`. Map the code to lo
 | Code | HTTP | Current message | Cause and next action |
 |---|---|---|---|
 | ADMIN_AUTH_REQUIRED | 401 | Admin authentication required | Sign in again |
-| AI_MODULE_NOT_CONNECTED | 501 | Nandan must connect the conversational agent using the validated tool interface | Use direct booking controls |
+| AI_MODULE_NOT_CONNECTED | 501 | Conversational agent provider is not configured | Configure server-side LLM_PROVIDER=gemini and GEMINI_API_KEY, then retry |
 | BOOKING_NOT_CONFIRMED | 400 | BOOKING_NOT_CONFIRMED | booking not confirmed. Correct input or state before retry. |
 | BRIEFING_DESTINATION_NOT_CONFIGURED | 400 | BRIEFING_DESTINATION_NOT_CONFIGURED | briefing destination not configured. Correct input or state before retry. |
 | CONFIRMATION_PENDING | 503 | Payment retained; retry confirmation with the same hold ID | Preserve hold ID and retry confirmation deliberately |
