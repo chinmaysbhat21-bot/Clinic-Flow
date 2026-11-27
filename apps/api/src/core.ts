@@ -1,7 +1,7 @@
 import { randomUUID,randomInt,scryptSync,timingSafeEqual,createHmac } from 'node:crypto';
 import { expireHolds,transaction,type DB } from './db.js';
 import type { BookingAdapter,Slot } from '../../../packages/shared/src/index.js';
-import { clinicDate,clinicHour } from './clinic-time.js';
+import { clinicDate,clinicHour,clinicTime } from './clinic-time.js';
 import { enqueueBookingNotice } from './notification-outbox.js';
 import { enqueueRefund } from './refund-records.js';
 export class Fault extends Error {constructor(public code:string,message:string,public status=400){super(message);}}
@@ -15,6 +15,11 @@ export class Engine {
  run(sql:string,...args:any[]){return this.db.prepare(sql).run(...args);}
  clinic(id:string){const c=this.one('SELECT * FROM clinics WHERE id=?',id);requireThat(c,'NOT_FOUND','Clinic not found',404);return {...c,config:JSON.parse(c.config)} as Row;}
  audit(clinic:string,action:string,id:string){this.run('INSERT INTO audit VALUES(?,?,?,?,?)',randomUUID(),clinic,action,id,this.now());}
+ auditDetails(clinic:string,action:string,id:string,actorId?:string|null,metadata?:Record<string,unknown>){
+  const auditId=randomUUID();
+  this.run('INSERT INTO audit VALUES(?,?,?,?,?)',auditId,clinic,action,id,this.now());
+  this.run('INSERT INTO audit_details VALUES(?,?,?)',auditId,actorId??null,metadata?JSON.stringify(metadata):null);
+ }
  consent(clinic:string,session:string,briefing=false){const record=this.one('SELECT * FROM consents WHERE clinic_id=? AND session_id=? ORDER BY created_at DESC,rowid DESC LIMIT 1',clinic,session);requireThat(record?.booking&&(!briefing||record.briefing),'CONSENT_REQUIRED');}
  hold(clinic:string,session:string,id:string,active=true){const h=this.one('SELECT * FROM holds WHERE id=? AND clinic_id=? AND session_id=?',id,clinic,session);requireThat(h,'NOT_FOUND','Hold not found',404);if(active)requireThat(h.expires_at>this.now()&&!['EXPIRED','CANCELLED'].includes(h.state),'HOLD_EXPIRED');return h;}
  booking(clinic:string,session:string,id:string){const a=this.one('SELECT * FROM appointments WHERE id=? AND clinic_id=? AND session_id=?',id,clinic,session);requireThat(a,'NOT_FOUND','Booking not found',404);return a;}
@@ -22,13 +27,19 @@ export class Engine {
  const c=this.clinic(clinic);const d=this.one('SELECT * FROM doctors WHERE id=? AND clinic_id=? AND active=1',doctorId,clinic);const s=this.one('SELECT * FROM services WHERE id=? AND clinic_id=? AND active=1',serviceId,clinic);
  requireThat(d&&s&&this.one('SELECT 1 FROM doctor_services WHERE doctor_id=? AND service_id=?',doctorId,serviceId),'INVALID_SELECTION');
  const schedule=JSON.parse(d.schedule);const day=new Date(`${date}T00:00:00Z`).getUTCDay();if(!schedule.days.includes(day))return [];
+ if(Array.isArray(c.config.holidays)&&c.config.holidays.some((h:{date?:string})=>h?.date===date))return [];
+ const rawBreaks=[...(Array.isArray(c.config.breaks)?c.config.breaks:[]),...(Array.isArray(schedule.breaks)?schedule.breaks:[])];
+ const breakWindows=rawBreaks.filter((b:{days?:number[]})=>!Array.isArray(b?.days)||b.days.includes(day)).map((b:{start:string;end:string})=>{
+  const bStart=clinicTime(date,b.start,c.config.timezone),bEnd=clinicTime(date,b.end,c.config.timezone);
+  return bStart!==undefined&&bEnd!==undefined&&bEnd>bStart?{start:bStart,end:bEnd}:null;
+ }).filter((w):w is {start:number;end:number}=>w!==null);
  const startHour=Math.max(schedule.start,c.config.operatingHours.start),endHour=Math.min(schedule.end,c.config.operatingHours.end);
  const startTime=clinicHour(date,startHour,c.config.timezone);
  const endTime=clinicHour(date,endHour,c.config.timezone);
  if(startTime===undefined||endTime===undefined)return [];
  const slots:Slot[]=[];
  for(let t=startTime;t+s.duration*60000<=endTime;t+=s.duration*60000){
- const start=new Date(t).toISOString(),end=new Date(t+s.duration*60000).toISOString();
+ const slotEnd=t+s.duration*60000;const start=new Date(t).toISOString(),end=new Date(slotEnd).toISOString();if(breakWindows.some(b=>b&&b.start<slotEnd&&b.end>t))continue;
  if(t<=this.now())continue;
  if(this.one('SELECT 1 FROM blocks WHERE clinic_id=? AND (doctor_id IS NULL OR doctor_id=?) AND start<? AND end>?',clinic,doctorId,end,start))continue;
  if(this.one("SELECT 1 FROM appointments WHERE (doctor_id=? OR (?='google' AND clinic_id=?)) AND state IN ('CONFIRMED','CONFIRMATION_PENDING') AND start<? AND end>?",doctorId,c.adapter,clinic,end,start))continue;
@@ -42,7 +53,7 @@ export class Engine {
  async reserve(clinic:string,session:string,input:{doctorId:string;serviceId:string;start:string}):Promise<Row>{
  this.consent(clinic,session);const date=clinicDate(Date.parse(input.start),this.clinic(clinic).config.timezone);const start=new Date(input.start).toISOString();
  const candidate=(await this.available(clinic,input.doctorId,input.serviceId,date)).find(s=>s.start===start);requireThat(candidate,'SLOT_UNAVAILABLE',undefined,409);
- const h=transaction(this.db,()=>{requireThat(this.slots(clinic,input.doctorId,input.serviceId,date).some(s=>s.start===start),'SLOT_UNAVAILABLE',undefined,409);const s=this.one('SELECT fee FROM services WHERE id=?',input.serviceId)!;const id=randomUUID(),expires=this.now()+this.clinic(clinic).config.holdSeconds*1000;
+ const h=transaction(this.db,()=>{requireThat(this.slots(clinic,input.doctorId,input.serviceId,date).some(s=>s.start===start&&s.end===candidate.end),'SLOT_UNAVAILABLE',undefined,409);const s=this.one('SELECT fee FROM services WHERE id=?',input.serviceId)!;const id=randomUUID(),expires=this.now()+this.clinic(clinic).config.holdSeconds*1000;
  this.run('INSERT INTO holds(id,clinic_id,session_id,doctor_id,service_id,start,end,fee,expires_at,state) VALUES(?,?,?,?,?,?,?,?,?,?)',id,clinic,session,input.doctorId,input.serviceId,start,candidate.end,s.fee,expires,'HELD');return this.hold(clinic,session,id);});
  try{const external=await this.adapters(clinic).holdSlot({id:h.id,doctorId:h.doctor_id,start:h.start,end:h.end,expiresAt:new Date(h.expires_at).toISOString()});this.run('UPDATE holds SET external_id=? WHERE id=?',external,h.id);return {...h,external_id:external};}catch(e){this.run("UPDATE holds SET state='CANCELLED' WHERE id=?",h.id);throw e;}
  }
@@ -66,7 +77,7 @@ export class Engine {
  requireThat(h.state==='PAYMENT_VERIFIED','VERIFICATION_REQUIRED');
  this.run("INSERT INTO booking_operations VALUES(?,'CONFIRM',NULL,?)",id,now);
  requireThat(h.state==='PAYMENT_VERIFIED','VERIFICATION_REQUIRED');const patient=this.one('SELECT * FROM patients WHERE clinic_id=? AND phone=?',clinic,h.phone);const patientId=patient?.id??randomUUID();if(!patient)this.run('INSERT INTO patients VALUES(?,?,?)',patientId,clinic,h.phone);
- const bookingId=randomUUID();this.run('INSERT INTO appointments VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',bookingId,`AH-${randomUUID().slice(0,8).toUpperCase()}`,clinic,session,id,h.doctor_id,h.service_id,patientId,h.start,h.end,'CONFIRMATION_PENDING',null,this.now());
+ const bookingId=randomUUID();const duration=Math.max(1,Math.round((Date.parse(h.end)-Date.parse(h.start))/60000));this.run('INSERT INTO appointments(id,reference,clinic_id,session_id,hold_id,doctor_id,service_id,patient_id,start,end,state,external_id,created_at,fee,duration) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',bookingId,`AH-${randomUUID().slice(0,8).toUpperCase()}`,clinic,session,id,h.doctor_id,h.service_id,patientId,h.start,h.end,'CONFIRMATION_PENDING',null,this.now(),h.fee,duration);
  this.run("UPDATE holds SET state='CONFIRMATION_PENDING' WHERE id=?",id);return this.booking(clinic,session,bookingId);});
  requireThat(a,'HOLD_EXPIRED');
  if(a.state==='CONFIRMED')return a;

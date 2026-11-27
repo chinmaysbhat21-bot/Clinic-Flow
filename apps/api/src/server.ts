@@ -1,6 +1,8 @@
 import express,{type Request,type Response,type NextFunction} from 'express';
 import { channels } from './notification-outbox.js';
 import { RefundWorker } from './refund-worker.js';
+import { buildAdminSummary,findBlockWarnings,findConfigWarnings,findDeactivationWarnings,findDoctorScheduleWarnings,isValidTimeZone,LoginLimiter,resolveReconciliation } from './admin.js';
+import { clinicHour } from './clinic-time.js';
 import { randomUUID,randomBytes,createHash,scryptSync } from 'node:crypto';
 import { z } from 'zod';
 import * as contracts from '../../../packages/shared/src/index.js';
@@ -18,6 +20,7 @@ export function createApp(db:DB,options:{mockBase?:string;mockKey:string;webhook
  const provider=options.provider??new RazorpayProvider(process.env.RAZORPAY_KEY_ID??'',process.env.RAZORPAY_KEY_SECRET??'');
  const payments=new Payments(engine,provider);
  const refunds=new RefundWorker(db,provider,process.env.REFUND_EXECUTION_MODE==='razorpay-test',engine.now);
+ const loginLimiter=new LoginLimiter();
  const hash=(s:string)=>createHash('sha256').update(s).digest('hex');
  app.use((req,res,next)=>{res.locals.requestId=randomUUID();res.setHeader('Cache-Control','no-store');res.setHeader('X-Content-Type-Options','nosniff');const origin=req.headers.origin;if(origin){if(!(options.origins??['http://localhost:5173','http://localhost:5174']).includes(origin))return next(new Fault('ORIGIN_NOT_ALLOWED','Origin not allowed',403));res.setHeader('Access-Control-Allow-Origin',origin);res.setHeader('Vary','Origin');res.setHeader('Access-Control-Allow-Headers','Content-Type, Authorization, X-Clinic-Id, X-Session-Id');res.setHeader('Access-Control-Allow-Methods','GET,POST,PATCH,DELETE,OPTIONS');}if(req.method==='OPTIONS'){res.sendStatus(204);return;}next();});
  const limits=new Map<string,{count:number;reset:number}>();app.use((req,res,next)=>{const key=req.socket.remoteAddress??'unknown',now=Date.now();if(limits.size>10000)for(const [k,v] of limits)if(v.reset<now)limits.delete(k);let value=limits.get(key);if(!value||value.reset<now){value={count:0,reset:now+60000};limits.set(key,value);}if(++value.count>120)return next(new Fault('RATE_LIMIT','Try again later',429));next();});
@@ -55,13 +58,88 @@ export function createApp(db:DB,options:{mockBase?:string;mockKey:string;webhook
  app.get('/api/health',(_req,res)=>{db.prepare('SELECT 1').get();ok(res,{database:'sqlite',status:'ok',otp:'DEVELOPMENT_ONLY',notifications:'SIMULATED',googleConfigured:!!process.env.GOOGLE_ACCESS_TOKEN,razorpayConfigured:!!process.env.RAZORPAY_KEY_ID});});
  app.post('/api/sessions',(req,res)=>{const {clinicId}=z.object({clinicId:z.string()}).parse(req.body);engine.clinic(clinicId);const id=randomBytes(32).toString('hex');engine.run('INSERT INTO sessions VALUES(?,?,?,?)',id,clinicId,engine.now(),engine.now()+86400000);ok(res,{sessionId:id,clinicId,expiresAt:new Date(engine.now()+86400000).toISOString()},201);});
  app.get('/api/clinics/:id/config',(req,res)=>{const c=engine.clinic(String(req.params.id));ok(res,{id:c.id,name:c.name,...c.config});});
- app.get('/api/clinics/:id/doctors',(req,res)=>ok(res,engine.all('SELECT id,name,schedule FROM doctors WHERE clinic_id=? AND active=1',String(req.params.id)).map(d=>({...d,schedule:JSON.parse(d.schedule)}))));
+ app.get('/api/clinics/:id/doctors',(req,res)=>ok(res,engine.all('SELECT id,name,specialization,schedule FROM doctors WHERE clinic_id=? AND active=1',String(req.params.id)).map(d=>({...d,schedule:JSON.parse(d.schedule)}))));
  app.get('/api/clinics/:id/services',(req,res)=>ok(res,engine.all('SELECT * FROM services WHERE clinic_id=? AND active=1',String(req.params.id))));
- app.post('/api/admin/login',(req,res)=>{const input=z.object({email:z.email(),password:z.string().min(1).max(200)}).parse(req.body),admin=engine.one('SELECT * FROM admins WHERE email=?',input.email);requireThat(admin&&equal(admin.password_hash,scryptSync(input.password,admin.salt,64).toString('hex')),'INVALID_CREDENTIALS',undefined,401);const token=randomBytes(32).toString('hex');engine.run('INSERT INTO admin_sessions VALUES(?,?,?)',hash(token),admin.clinic_id,engine.now()+3600000);ok(res,{token,clinicId:admin.clinic_id,expiresIn:3600});});
- app.use('/api/admin',(req,res,next)=>{const token=req.headers.authorization?.replace(/^Bearer /,'');const a=token&&engine.one('SELECT * FROM admin_sessions WHERE token_hash=? AND expires_at>?',hash(token),engine.now());if(!a)return next(new Fault('ADMIN_AUTH_REQUIRED','Admin authentication required',401));res.locals.clinic=a.clinic_id;next();});
- const adminAppointment = ({id,reference,doctor_id,service_id,start,end,state}: Record<string,unknown>) => ({id,reference,doctor_id,service_id,start,end,state});
- app.get('/api/admin/appointments',(req,res)=>{const filter=z.object({state:contracts.BookingStatus.optional(),search:z.string().max(100).optional()}).parse(req.query);ok(res,engine.all('SELECT id,reference,doctor_id,service_id,start,end,state FROM appointments WHERE clinic_id=? AND (? IS NULL OR state=?) AND (? IS NULL OR reference LIKE ?) ORDER BY start LIMIT 200',res.locals.clinic,filter.state??null,filter.state??null,filter.search??null,`%${filter.search??''}%`));});
+
+ // ── Admin authentication ──────────────────────────────────────────────────
+ app.post('/api/admin/login',(req,res)=>{
+  const input=z.object({email:z.email(),password:z.string().min(1).max(200)}).parse(req.body);
+  const now=engine.now();
+  loginLimiter.check(input.email,now);
+  const admin=engine.one('SELECT * FROM admins WHERE email=?',input.email);
+  if(!admin||!equal(admin.password_hash,scryptSync(input.password,admin.salt,64).toString('hex'))){
+   loginLimiter.fail(input.email,now);
+   throw new Fault('INVALID_CREDENTIALS','Invalid email or password',401);
+  }
+  loginLimiter.clear(input.email);
+  const token=randomBytes(32).toString('hex');
+  const adminId=String(admin.id),role=String(admin.role);
+  engine.run('INSERT INTO admin_sessions(token_hash,clinic_id,expires_at,admin_id) VALUES(?,?,?,?)',hash(token),admin.clinic_id,now+3600000,adminId);
+  engine.auditDetails(admin.clinic_id,'ADMIN_LOGIN',adminId,adminId);
+  ok(res,{token,clinicId:admin.clinic_id,adminId,role,expiresIn:3600});
+ });
+
+ // ── Admin middleware: validate session and populate locals ────────────────
+ app.use('/api/admin',(req,res,next)=>{
+  const token=req.headers.authorization?.replace(/^Bearer /,'');
+  const a=token&&engine.one('SELECT s.*,a.role FROM admin_sessions s JOIN admins a ON a.id=s.admin_id AND a.clinic_id=s.clinic_id WHERE s.token_hash=? AND s.expires_at>?',hash(token),engine.now());
+  if(!a)return next(new Fault('ADMIN_AUTH_REQUIRED','Admin authentication required',401));
+  res.locals.clinic=a.clinic_id;
+  res.locals.adminId=String(a.admin_id);
+  res.locals.adminRole=String(a.role);
+  next();
+ });
+
+ // ── Admin logout ──────────────────────────────────────────────────────────
+ app.delete('/api/admin/session',(req,res)=>{
+  const token=req.headers.authorization?.replace(/^Bearer /,'');
+  if(token)engine.run('DELETE FROM admin_sessions WHERE token_hash=?',hash(token));
+  engine.auditDetails(res.locals.clinic,'ADMIN_LOGOUT',res.locals.adminId,res.locals.adminId);
+  ok(res,{loggedOut:true});
+ });
+
+ // ── Admin appointments ────────────────────────────────────────────────────
+ const adminAppointment=({id,reference,doctor_id,service_id,start,end,state}:Record<string,unknown>)=>({id,reference,doctor_id,service_id,start,end,state});
+ app.get('/api/admin/appointments',(req,res)=>{
+  const filter=z.object({
+   state:contracts.BookingStatus.optional(),
+   search:z.string().max(100).optional(),
+   from:z.iso.date().optional(),
+   to:z.iso.date().optional(),
+   doctorId:z.string().optional(),
+  }).refine(q=>!q.from||!q.to||q.from<=q.to).parse(req.query);
+  const zone=engine.clinic(res.locals.clinic).config.timezone;
+  const fromMs=filter.from?clinicHour(filter.from,0,zone):null;
+  const toMs=filter.to?clinicHour(filter.to,24,zone):null;
+  requireThat(fromMs!==undefined&&toMs!==undefined,'INVALID_DATE_RANGE');
+  ok(res,engine.all(
+   `SELECT id,reference,doctor_id,service_id,start,end,state FROM appointments
+    WHERE clinic_id=?
+    AND (? IS NULL OR state=?)
+    AND (? IS NULL OR reference LIKE ?)
+    AND (? IS NULL OR doctor_id=?)
+    AND (? IS NULL OR start>=?)
+    AND (? IS NULL OR start<?)
+    ORDER BY start LIMIT 200`,
+   res.locals.clinic,
+   filter.state??null,filter.state??null,
+   filter.search??null,`%${filter.search??''}%`,
+   filter.doctorId??null,filter.doctorId??null,
+   fromMs===null?null:fromMs,fromMs===null?null:new Date(fromMs).toISOString(),
+   toMs===null?null:toMs,toMs===null?null:new Date(toMs).toISOString(),
+  ));
+ });
+ app.get('/api/admin/appointments/:id',(req,res)=>{
+  const a=engine.one('SELECT * FROM appointments WHERE id=? AND clinic_id=?',String(req.params.id),res.locals.clinic);
+  requireThat(a,'NOT_FOUND',undefined,404);
+  ok(res,contracts.adminAppointmentDetail.parse(a));
+ });
+
+ // ── Admin overview / summary ──────────────────────────────────────────────
  app.get('/api/admin/overview',(_req,res)=>ok(res,engine.all('SELECT state,COUNT(*) AS count FROM appointments WHERE clinic_id=? GROUP BY state',res.locals.clinic)));
+ app.get('/api/admin/summary',(_req,res)=>ok(res,buildAdminSummary(engine,res.locals.clinic)));
+
+ // ── Reconciliation ────────────────────────────────────────────────────────
  app.get('/api/admin/reconciliation',(_req,res)=>ok(res,engine.all(`
   SELECT j.id,j.kind,j.status,j.attempts,j.next_at AS nextAttemptAt,j.last_error AS reason,a.reference AS bookingReference
   FROM reconciliation_jobs j LEFT JOIN appointments a ON a.hold_id=j.operation_ref AND a.clinic_id=j.clinic_id
@@ -72,20 +150,142 @@ export function createApp(db:DB,options:{mockBase?:string;mockKey:string;webhook
    OR EXISTS (SELECT 1 FROM booking_operations o WHERE o.booking_key=j.operation_ref AND o.kind=j.kind AND o.started_at=j.generation)
   ) ORDER BY j.next_at LIMIT 200
  `,res.locals.clinic)));
+
+ app.post('/api/admin/reconciliation/:id/resolve',async(req,res)=>{
+  const p=z.object({reason:z.string().min(1).max(500)}).parse(req.body);
+  ok(res,await resolveReconciliation(engine,payments,provider,refunds,res.locals.clinic,res.locals.adminId,String(req.params.id),{action:'RESOLVE',reason:p.reason}));
+ });
+ app.post('/api/admin/reconciliation/:id/requeue',async(req,res)=>{
+  const p=z.object({reason:z.string().min(1).max(500)}).parse(req.body);
+  ok(res,await resolveReconciliation(engine,payments,provider,refunds,res.locals.clinic,res.locals.adminId,String(req.params.id),{action:'REQUEUE',reason:p.reason}));
+ });
+
+ // ── Config ────────────────────────────────────────────────────────────────
  app.get('/api/admin/config',(_req,res)=>ok(res,engine.clinic(res.locals.clinic)));
- const schedule=z.object({days:z.array(z.number().int().min(0).max(6)).min(1),start:z.number().int().min(0).max(23),end:z.number().int().min(1).max(24)}).refine(s=>s.end>s.start);
- const configPatch=z.object({holdSeconds:z.number().int().min(60).max(900).optional(),operatingHours:z.object({start:z.number().int().min(0).max(23),end:z.number().int().min(1).max(24)}).refine(s=>s.end>s.start).optional(),languages:z.array(contracts.language).min(1).optional(),branding:z.object({color:z.string().regex(/^#[0-9a-fA-F]{6}$/)}).optional(),greeting:z.string().max(500).optional(),handoff:z.string().max(100).optional(),emergency:z.string().max(500).optional(),faqs:z.array(z.object({question:z.string().max(300),answer:z.string().max(1000)})).max(50).optional(),refundCutoffHours:z.number().int().min(0).max(720).optional()}).strict();
- app.patch('/api/admin/config',(req,res)=>{const c=engine.clinic(res.locals.clinic),patch=configPatch.parse(req.body);engine.run('UPDATE clinics SET config=? WHERE id=?',JSON.stringify({...c.config,...patch}),c.id);engine.audit(c.id,'CONFIG_UPDATED',c.id);ok(res,engine.clinic(c.id));});
+ const time=z.string().regex(/^(?:[01]\d|2[0-3]):[0-5]\d$/);
+ const breakRule=z.object({start:time,end:time,days:z.array(z.number().int().min(0).max(6)).optional()}).refine(b=>b.start<b.end);
+ const holidayRule=z.object({date:z.iso.date(),reason:z.string().max(100).optional()});
+ const schedule=z.object({days:z.array(z.number().int().min(0).max(6)).min(1),start:z.number().int().min(0).max(23),end:z.number().int().min(1).max(24),breaks:z.array(breakRule).optional()}).refine(s=>s.end>s.start);
+ const configPatch=z.object({
+  holdSeconds:z.number().int().min(60).max(900).optional(),
+  operatingHours:z.object({start:z.number().int().min(0).max(23),end:z.number().int().min(1).max(24)}).refine(s=>s.end>s.start).optional(),
+  languages:z.array(contracts.language).min(1).optional(),
+  branding:z.object({color:z.string().regex(/^#[0-9a-fA-F]{6}$/)}).optional(),
+  greeting:z.string().max(500).optional(),
+  handoff:z.string().max(100).optional(),
+  emergency:z.string().max(500).optional(),
+  faqs:z.array(z.object({question:z.string().max(300),answer:z.string().max(1000)})).max(50).optional(),
+  refundCutoffHours:z.number().int().min(0).max(720).optional(),
+  timezone:z.string().optional(),
+  holidays:z.array(holidayRule).max(100).optional(),
+  breaks:z.array(breakRule).max(50).optional(),
+ }).strict();
+ app.patch('/api/admin/config',(req,res)=>{
+  const c=engine.clinic(res.locals.clinic),patch=configPatch.parse(req.body);
+  if(patch.timezone!==undefined)requireThat(isValidTimeZone(patch.timezone),'INVALID_TIMEZONE','Invalid IANA timezone');
+  engine.run('UPDATE clinics SET config=? WHERE id=?',JSON.stringify({...c.config,...patch}),c.id);
+  engine.auditDetails(c.id,'CONFIG_UPDATED',c.id,res.locals.adminId,{fields:Object.keys(patch)});
+  const warnings=findConfigWarnings(engine,c.id);
+  ok(res,{...engine.clinic(c.id),warnings});
+ });
+
+ // ── Doctors ───────────────────────────────────────────────────────────────
  app.get('/api/admin/doctors',(_req,res)=>ok(res,engine.all('SELECT * FROM doctors WHERE clinic_id=?',res.locals.clinic).map(d=>({...d,schedule:JSON.parse(d.schedule)}))));
- app.post('/api/admin/doctors',(req,res)=>{const d=z.object({name:z.string().min(1).max(100),schedule,serviceIds:z.array(z.string()).min(1)}).parse(req.body);const id=randomUUID();transaction(db,()=>{for(const s of d.serviceIds)requireThat(engine.one('SELECT id FROM services WHERE id=? AND clinic_id=?',s,res.locals.clinic),'INVALID_SERVICE');engine.run('INSERT INTO doctors VALUES(?,?,?,?,?)',id,res.locals.clinic,d.name,1,JSON.stringify(d.schedule));for(const s of d.serviceIds)engine.run('INSERT INTO doctor_services VALUES(?,?)',id,s);});ok(res,{id},201);});
- app.patch('/api/admin/doctors/:id',(req,res)=>{const p=z.object({name:z.string().min(1).max(100).optional(),active:z.boolean().optional()}).strict().parse(req.body);const id=String(req.params.id),d=engine.one('SELECT * FROM doctors WHERE id=? AND clinic_id=?',id,res.locals.clinic);requireThat(d,'NOT_FOUND',undefined,404);engine.run('UPDATE doctors SET name=?,active=? WHERE id=?',p.name??d.name,p.active===undefined?d.active:Number(p.active),id);ok(res,{id});});
- app.patch('/api/admin/doctors/:id/availability',(req,res)=>{const s=schedule.parse(req.body);requireThat(engine.one('SELECT id FROM doctors WHERE id=? AND clinic_id=?',String(req.params.id),res.locals.clinic),'NOT_FOUND',undefined,404);engine.run('UPDATE doctors SET schedule=? WHERE id=?',JSON.stringify(s),String(req.params.id));ok(res,{updated:true});});
+ app.post('/api/admin/doctors',(req,res)=>{
+  const d=z.object({name:z.string().min(1).max(100),specialization:z.string().max(100).default(''),schedule,serviceIds:z.array(z.string()).min(1)}).parse(req.body);
+  const id=randomUUID();
+  transaction(db,()=>{
+   for(const s of d.serviceIds)requireThat(engine.one('SELECT id FROM services WHERE id=? AND clinic_id=?',s,res.locals.clinic),'INVALID_SERVICE');
+   engine.run('INSERT INTO doctors(id,clinic_id,name,active,schedule,specialization) VALUES(?,?,?,?,?,?)',id,res.locals.clinic,d.name,1,JSON.stringify(d.schedule),d.specialization);
+   for(const s of d.serviceIds)engine.run('INSERT INTO doctor_services VALUES(?,?)',id,s);
+  });
+  engine.auditDetails(res.locals.clinic,'DOCTOR_CREATED',id,res.locals.adminId,{name:d.name});
+  ok(res,{id},201);
+ });
+ app.patch('/api/admin/doctors/:id',(req,res)=>{
+  const p=z.object({name:z.string().min(1).max(100).optional(),specialization:z.string().max(100).optional(),active:z.boolean().optional()}).strict().parse(req.body);
+  const id=String(req.params.id),d=engine.one('SELECT * FROM doctors WHERE id=? AND clinic_id=?',id,res.locals.clinic);
+  requireThat(d,'NOT_FOUND',undefined,404);
+  engine.run('UPDATE doctors SET name=?,specialization=?,active=? WHERE id=?',p.name??d.name,p.specialization??d.specialization,p.active===undefined?d.active:Number(p.active),id);
+  engine.auditDetails(res.locals.clinic,'DOCTOR_UPDATED',id,res.locals.adminId,{fields:Object.keys(p)});
+  const warnings=p.active===false?findDeactivationWarnings(engine,res.locals.clinic,'doctor_id',id,'DOCTOR_DEACTIVATED'):[];
+  ok(res,{id,warnings});
+ });
+ app.patch('/api/admin/doctors/:id/availability',(req,res)=>{
+  const s=schedule.parse(req.body);
+  const id=String(req.params.id);
+  requireThat(engine.one('SELECT id FROM doctors WHERE id=? AND clinic_id=?',id,res.locals.clinic),'NOT_FOUND',undefined,404);
+  engine.run('UPDATE doctors SET schedule=? WHERE id=?',JSON.stringify(s),id);
+  engine.auditDetails(res.locals.clinic,'DOCTOR_SCHEDULE_UPDATED',id,res.locals.adminId);
+  const warnings=findDoctorScheduleWarnings(engine,res.locals.clinic,id,s);
+  ok(res,{updated:true,warnings});
+ });
+ app.get('/api/admin/doctors/:id/services',(req,res)=>{
+  const id=String(req.params.id);
+  requireThat(engine.one('SELECT id FROM doctors WHERE id=? AND clinic_id=?',id,res.locals.clinic),'NOT_FOUND',undefined,404);
+  ok(res,engine.all('SELECT s.* FROM services s JOIN doctor_services ds ON ds.service_id=s.id WHERE ds.doctor_id=?',id));
+ });
+ app.post('/api/admin/doctors/:id/services',(req,res)=>{
+  const id=String(req.params.id);
+  requireThat(engine.one('SELECT id FROM doctors WHERE id=? AND clinic_id=?',id,res.locals.clinic),'NOT_FOUND',undefined,404);
+  const {serviceId}=z.object({serviceId:z.string()}).parse(req.body);
+  requireThat(engine.one('SELECT id FROM services WHERE id=? AND clinic_id=?',serviceId,res.locals.clinic),'INVALID_SERVICE');
+  engine.run('INSERT OR IGNORE INTO doctor_services VALUES(?,?)',id,serviceId);
+  engine.auditDetails(res.locals.clinic,'DOCTOR_SERVICE_ASSIGNED',id,res.locals.adminId,{serviceId});
+  ok(res,{assigned:true});
+ });
+ app.delete('/api/admin/doctors/:id/services/:serviceId',(req,res)=>{
+  const id=String(req.params.id),serviceId=String(req.params.serviceId);
+  requireThat(engine.one('SELECT id FROM doctors WHERE id=? AND clinic_id=?',id,res.locals.clinic),'NOT_FOUND',undefined,404);
+  engine.run('DELETE FROM doctor_services WHERE doctor_id=? AND service_id=?',id,serviceId);
+  engine.auditDetails(res.locals.clinic,'DOCTOR_SERVICE_UNASSIGNED',id,res.locals.adminId,{serviceId});
+  ok(res,{unassigned:true});
+ });
+
+ // ── Services ──────────────────────────────────────────────────────────────
  app.get('/api/admin/services',(_req,res)=>ok(res,engine.all('SELECT * FROM services WHERE clinic_id=?',res.locals.clinic)));
- const service=z.object({name:z.string().min(1).max(100),duration:z.number().int().min(5).max(240),fee:z.number().int().min(100).max(10000000),active:z.boolean().default(true)});
- app.post('/api/admin/services',(req,res)=>{const s=service.parse(req.body),id=randomUUID();engine.run('INSERT INTO services VALUES(?,?,?,?,?,?)',id,res.locals.clinic,s.name,s.duration,s.fee,Number(s.active));ok(res,{id},201);});
- app.patch('/api/admin/services/:id',(req,res)=>{const p=service.partial().parse(req.body),id=String(req.params.id),s=engine.one('SELECT * FROM services WHERE id=? AND clinic_id=?',id,res.locals.clinic);requireThat(s,'NOT_FOUND',undefined,404);engine.run('UPDATE services SET name=?,duration=?,fee=?,active=? WHERE id=?',p.name??s.name,p.duration??s.duration,p.fee??s.fee,p.active===undefined?s.active:Number(p.active),id);ok(res,{id});});
- app.post('/api/admin/blocks',(req,res)=>{const p=z.object({doctorId:z.string().optional(),start:z.iso.datetime(),end:z.iso.datetime(),reason:z.string().max(100)}).refine(s=>s.end>s.start).parse(req.body);if(p.doctorId)requireThat(engine.one('SELECT id FROM doctors WHERE id=? AND clinic_id=?',p.doctorId,res.locals.clinic),'INVALID_DOCTOR');const id=randomUUID();engine.run('INSERT INTO blocks VALUES(?,?,?,?,?,?)',id,res.locals.clinic,p.doctorId??null,p.start,p.end,p.reason);ok(res,{id},201);});
- for(const [path,table] of [['payments','payments'],['audit-logs','audit'],['blocks','blocks']])app.get(`/api/admin/${path}`,(_req,res)=>ok(res,engine.all(`SELECT * FROM ${table} WHERE clinic_id=? LIMIT 200`,res.locals.clinic)));
+ const serviceFields=z.object({name:z.string().min(1).max(100),duration:z.number().int().min(5).max(240),fee:z.number().int().min(100).max(10000000),active:z.boolean(),description:z.string().max(500)});
+ const serviceSchema=serviceFields.extend({active:z.boolean().default(true),description:z.string().max(500).default('')});
+ app.post('/api/admin/services',(req,res)=>{
+  const s=serviceSchema.parse(req.body),id=randomUUID();
+  engine.run('INSERT INTO services(id,clinic_id,name,duration,fee,active,description) VALUES(?,?,?,?,?,?,?)',id,res.locals.clinic,s.name,s.duration,s.fee,Number(s.active),s.description);
+  engine.auditDetails(res.locals.clinic,'SERVICE_CREATED',id,res.locals.adminId,{name:s.name});
+  ok(res,{id},201);
+ });
+ app.patch('/api/admin/services/:id',(req,res)=>{
+  const p=serviceFields.partial().parse(req.body),id=String(req.params.id);
+  const s=engine.one('SELECT * FROM services WHERE id=? AND clinic_id=?',id,res.locals.clinic);
+  requireThat(s,'NOT_FOUND',undefined,404);
+  engine.run('UPDATE services SET name=?,duration=?,fee=?,active=?,description=? WHERE id=?',p.name??s.name,p.duration??s.duration,p.fee??s.fee,p.active===undefined?s.active:Number(p.active),p.description??s.description,id);
+  engine.auditDetails(res.locals.clinic,'SERVICE_UPDATED',id,res.locals.adminId,{fields:Object.keys(p)});
+  const warnings=p.active===false?findDeactivationWarnings(engine,res.locals.clinic,'service_id',id,'SERVICE_DEACTIVATED'):[];
+  ok(res,{id,warnings});
+ });
+
+ // ── Blocks ────────────────────────────────────────────────────────────────
+ app.post('/api/admin/blocks',(req,res)=>{
+  const p=z.object({doctorId:z.string().optional(),start:z.iso.datetime(),end:z.iso.datetime(),reason:z.string().max(100)}).refine(s=>s.end>s.start).parse(req.body);
+  if(p.doctorId)requireThat(engine.one('SELECT id FROM doctors WHERE id=? AND clinic_id=?',p.doctorId,res.locals.clinic),'INVALID_DOCTOR');
+  const id=randomUUID();
+  engine.run('INSERT INTO blocks VALUES(?,?,?,?,?,?)',id,res.locals.clinic,p.doctorId??null,p.start,p.end,p.reason);
+  engine.auditDetails(res.locals.clinic,'BLOCK_CREATED',id,res.locals.adminId);
+  const warnings=findBlockWarnings(engine,res.locals.clinic,p.doctorId,p.start,p.end);
+  ok(res,{id,warnings},201);
+ });
+ app.delete('/api/admin/blocks/:id',(req,res)=>{
+  const id=String(req.params.id);
+  requireThat(engine.one('SELECT id FROM blocks WHERE id=? AND clinic_id=?',id,res.locals.clinic),'NOT_FOUND',undefined,404);
+  engine.run('DELETE FROM blocks WHERE id=? AND clinic_id=?',id,res.locals.clinic);
+  engine.auditDetails(res.locals.clinic,'BLOCK_DELETED',id,res.locals.adminId);
+  ok(res,{deleted:true});
+ });
+
+ // ── Read-only admin lists ──────────────────────────────────────────────────
+ for(const [path,table] of [['payments','payments'],['blocks','blocks']])app.get(`/api/admin/${path}`,(_req,res)=>ok(res,engine.all(`SELECT * FROM ${table} WHERE clinic_id=? LIMIT 200`,res.locals.clinic)));
+ app.get('/api/admin/audit-logs',(_req,res)=>ok(res,engine.all(`
+  SELECT a.*,d.actor_id FROM audit a LEFT JOIN audit_details d ON d.audit_id=a.id
+  WHERE a.clinic_id=? ORDER BY a.created_at DESC,a.id LIMIT 200
+ `,res.locals.clinic)));
  app.get('/api/admin/outbox',(_req,res)=>ok(res,engine.all(`
   SELECT o.id,o.clinic_id,o.appointment_id,o.kind,NULL AS destination,o.payload,
    COALESCE(j.status,o.status) AS status,j.last_error AS error
@@ -105,7 +305,11 @@ export function createApp(db:DB,options:{mockBase?:string;mockKey:string;webhook
   FROM refund_operations r LEFT JOIN appointments a ON a.id=r.appointment_id AND a.clinic_id=r.clinic_id
   WHERE r.clinic_id=? ORDER BY r.created_at DESC,r.id LIMIT 200
  `,res.locals.clinic)));
+
+ // ── Admin appointment actions ─────────────────────────────────────────────
  app.post('/api/admin/appointments/:id/:action',async(req,res)=>{const a=engine.one('SELECT * FROM appointments WHERE id=? AND clinic_id=?',String(req.params.id),res.locals.clinic);requireThat(a,'NOT_FOUND',undefined,404);if(req.params.action==='cancel')ok(res,adminAppointment(await engine.cancel(a.clinic_id,a.session_id,a.id)));else if(req.params.action==='reschedule'){const p=contracts.holdRequest.parse(req.body);const start=new Date(p.start).toISOString();if(a.state==='CONFIRMED'&&a.start===start&&a.doctor_id===p.doctorId&&a.service_id===p.serviceId){ok(res,adminAppointment(a));return;}requireThat(!engine.one('SELECT booking_key FROM booking_operations WHERE booking_key=?',a.hold_id),'RESCHEDULE_PENDING','Booking operation pending reconciliation',503);const h=await engine.reserve(a.clinic_id,a.session_id,p);ok(res,adminAppointment(await engine.reschedule(a.clinic_id,a.session_id,a.id,h.id)));}else throw new Fault('NOT_FOUND','Unknown action',404);});
+
+ // ── Patient session middleware ─────────────────────────────────────────────
  app.use('/api',(req,res,next)=>{const clinic=String(req.headers['x-clinic-id']??''),session=String(req.headers['x-session-id']??'');const s=engine.one('SELECT * FROM sessions WHERE id=? AND clinic_id=? AND expires_at>?',session,clinic,engine.now());if(!s)return next(new Fault('SESSION_REQUIRED','Valid clinic session headers required',401));res.locals.clinic=clinic;res.locals.session=session;next();});
  app.post('/api/consent',(req,res)=>{const p=contracts.consentRequest.parse(req.body);engine.run('INSERT INTO consents VALUES(?,?,?,?,?,?)',randomUUID(),res.locals.session,res.locals.clinic,1,Number(p.briefing),engine.now());ok(res,{recorded:true});});
  app.post('/api/notification-preferences',(req,res)=>{
