@@ -151,6 +151,120 @@ async function fixture(path = ':memory:'){
  return {...state,provider,db,request,webhook,session,codes,input,consent,reserve,verifiedHold,pay,advance:(ms:number)=>{now+=ms;},close:async()=>{server.closeAllConnections();await new Promise<void>(r=>server.close(()=>r()));db.close();}};
 }
 
+test('admin filters, fee updates, logout and clinic scoping preserve booking data',async()=>{
+ const f=await fixture();
+ try{
+  const hold=await f.verifiedHold();
+  const checkout=await f.pay(hold.id);
+  await checkout.verify();
+  const booking=await f.engine.confirm('lotus',f.session,hold.id);
+  const login=async(clinic:string)=>(await f.request('/api/admin/login','POST',{email:clinic+'@demo.invalid',password:'test-password-123'})).data.token;
+  const lotus=await login('lotus'),harbor=await login('harbor');
+  const call=(path:string,method='GET',body?:unknown,token=lotus)=>f.request('/api/admin'+path,method,body,undefined,'lotus',token);
+  assert.equal((await call('/appointments?from=2026-12-01&to=2026-12-01')).data[0].id,booking.id);
+  assert.equal((await call('/appointments?from=bad')).status,400);
+  assert.equal((await call('/appointments/'+booking.id,'GET',undefined,harbor)).status,404);
+  const detail=(await call('/appointments/'+booking.id)).data;
+  assert.deepEqual(Object.keys(detail).sort(),['id','reference','doctor_id','service_id','start','end','state','fee','duration'].sort());
+  assert.equal(detail.fee,hold.fee);
+  assert.equal(detail.duration,30);
+  assert.equal((await call('/summary')).data.finance.verifiedPayments.amount,hold.fee);
+  assert.equal((await call('/services/lotus-consult','PATCH',{active:false,description:'Fixture'})).status,200);
+  assert.equal((await call('/services/lotus-consult','PATCH',{fee:60000})).status,200);
+  const service=f.engine.one('SELECT active,description FROM services WHERE id=?','lotus-consult');
+  assert.equal(service?.active,0);
+  assert.equal(service?.description,'Fixture');
+  assert.equal(f.engine.one('SELECT amount FROM payments WHERE hold_id=?',hold.id)?.amount,hold.fee);
+  assert.equal(f.engine.booking('lotus',f.session,booking.id).state,'CONFIRMED');
+  assert.equal((await call('/audit-logs')).data.some((entry:{actor_id:string|null;action:string})=>entry.actor_id&&entry.action==='SERVICE_UPDATED'),true);
+  assert.equal((await call('/session','DELETE')).data.loggedOut,true);
+  assert.equal((await call('/summary')).status,401);
+  const expiring=await login('lotus');
+  f.advance(3600000);
+  assert.equal((await call('/summary','GET',undefined,expiring)).status,401);
+ }finally{await f.close();}
+});
+
+test('availability reflects admin schedules, holidays, blocks and doctor-service assignments while preserving existing holds',async()=>{
+ const f=await fixture();
+ try{
+  await f.consent();
+  const hold=(await f.reserve()).data;
+  const login=await f.request('/api/admin/login','POST',{email:'lotus@demo.invalid',password:'test-password-123'});
+  const admin=(path:string,method:string,body?:unknown)=>f.request('/api/admin'+path,method,body,undefined,'lotus',login.data.token);
+  const slots=(date:string)=>f.engine.slots('lotus','lotus-doctor','lotus-consult',date);
+  assert.equal((await admin('/config','PATCH',{holidays:[{date:'2026-12-02'}],breaks:[{start:'10:00',end:'11:00',days:[2]}]})).status,200);
+  assert.deepEqual(slots('2026-12-02'),[]);
+  assert.ok(!slots('2026-12-01').some(s=>s.start==='2026-12-01T04:30:00.000Z'));
+  assert.equal((await admin('/doctors/lotus-doctor/availability','PATCH',{days:[2],start:9,end:17})).status,200);
+  assert.deepEqual(slots('2026-12-03'),[]);
+  const block={start:'2026-12-01T06:30:00.000Z',end:'2026-12-01T07:00:00.000Z',reason:'Fixture'};
+  const created=await admin('/blocks','POST',block);
+  assert.equal(created.status,201);
+  assert.ok(!slots('2026-12-01').some(s=>s.start===block.start));
+  assert.equal((await admin('/blocks/'+created.data.id,'DELETE')).status,200);
+  assert.ok(slots('2026-12-01').some(s=>s.start===block.start));
+  assert.equal((await admin('/doctors/lotus-doctor/services/lotus-consult','DELETE')).status,200);
+  assert.throws(()=>slots('2026-12-01'),{code:'INVALID_SELECTION'});
+  assert.equal((await admin('/doctors/lotus-doctor/services','POST',{serviceId:'harbor-consult'})).status,400);
+  assert.equal((await admin('/doctors/lotus-doctor/services','POST',{serviceId:'lotus-consult'})).status,200);
+  assert.equal((await admin('/doctors/lotus-doctor','PATCH',{active:false})).status,200);
+  assert.throws(()=>slots('2026-12-01'),{code:'INVALID_SELECTION'});
+  assert.equal(f.engine.hold('lotus',f.session,hold.id).state,'HELD');
+ }finally{await f.close();}
+});
+
+test('Phase 8 migration retains populated catalog rows and leaves legacy admin sessions unlinked',()=>{
+ const directory=mkdtempSync(join(tmpdir(),'clinic-admin-migration-'));
+ const path=join(directory,'clinic.db');
+ try{
+  const legacy=openDb(path);
+  try{
+   seed(legacy,'fixture-password');
+   legacy.exec(`ALTER TABLE admin_sessions DROP COLUMN admin_id;
+    ALTER TABLE admins DROP COLUMN role;
+    ALTER TABLE doctors DROP COLUMN specialization;
+    ALTER TABLE services DROP COLUMN description;
+    ALTER TABLE appointments DROP COLUMN fee;
+    ALTER TABLE appointments DROP COLUMN duration;
+    INSERT INTO admin_sessions VALUES('fixture-hash','lotus',12345);`);
+  }finally{legacy.close();}
+  const migrated=openDb(path);
+  try{
+   const session=migrated.prepare('SELECT clinic_id,expires_at,admin_id FROM admin_sessions WHERE token_hash=?').get('fixture-hash');
+   assert.equal(session?.clinic_id,'lotus');
+   assert.equal(session?.expires_at,12345);
+   assert.equal(session?.admin_id,null);
+   assert.equal(migrated.prepare("SELECT role FROM admins WHERE clinic_id='lotus'").get()?.role,'OWNER');
+   assert.equal(migrated.prepare("SELECT fee FROM services WHERE id='lotus-consult'").get()?.fee,50000);
+   assert.deepEqual(migrated.prepare('PRAGMA foreign_key_check').all(),[]);
+  }finally{migrated.close();}
+ }finally{rmSync(directory,{recursive:true});}
+});
+
+test('manual reconciliation retains the guard when the provider has no matching event',async()=>{
+ const f=await fixture();
+ try{
+  const hold=await f.verifiedHold();
+  await (await f.pay(hold.id)).verify();
+  const adapter=f.engine.adapters('lotus');
+  adapter.confirmBooking=async()=>{throw new Error('Lost provider outcome');};
+  adapter.lookupBooking=async()=>null;
+  f.engine.adapters=()=>adapter;
+  await assert.rejects(f.engine.confirm('lotus',f.session,hold.id),{code:'CONFIRMATION_PENDING'});
+  f.advance(31000);
+  const worker=new ReconciliationWorker(f.engine,f.payments,f.provider,{graceMs:0,maxAttempts:1});
+  await worker.runOnce();
+  const job=f.engine.one("SELECT id,status FROM reconciliation_jobs WHERE kind='CONFIRM'")!;
+  assert.equal(job.status,'MANUAL');
+  const login=await f.request('/api/admin/login','POST',{email:'lotus@demo.invalid',password:'test-password-123'});
+  const resolution=await f.request('/api/admin/reconciliation/'+job.id+'/resolve','POST',{reason:'Provider reviewed'},undefined,'lotus',login.data.token);
+  assert.equal(resolution.error.code,'RECONCILIATION_EVIDENCE_UNAVAILABLE');
+  assert.ok(f.engine.one('SELECT * FROM booking_operations WHERE booking_key=?',hold.id));
+  assert.equal(f.engine.one('SELECT state FROM payments WHERE hold_id=?',hold.id)?.state,'VERIFIED');
+ }finally{await f.close();}
+});
+
 test('local OTP delivery requires explicit development configuration',()=>{
  const lines:string[]=[];
  const delivery=configureOtpDelivery('development','development-console',line=>lines.push(line));
@@ -733,6 +847,35 @@ test('refund worker rejects excess, prior refunds and provider failure without r
   assert.equal(f.engine.one('SELECT status FROM refund_operations')?.status,'MANUAL');
   assert.equal(f.engine.one('SELECT state FROM payments')?.state,'REFUND_PENDING');
   assert.equal(f.engine.one("SELECT COUNT(*) n FROM notification_jobs WHERE event='REFUND_COMPLETED'")?.n,0);
+ }finally{await f.close();}
+});
+test('authenticated administration supports clinic operations and evidence-only requeue',async()=>{
+ const f=await fixture();
+ try{
+  const auth={email:'lotus@demo.invalid',password:'test-password-123'};
+  assert.equal((await f.request('/api/admin/login','POST',{...auth,password:'incorrect'})).status,401);
+  const login=await f.request('/api/admin/login','POST',auth);
+  const admin=(path:string,method='GET',body?:unknown)=>f.request('/api/admin'+path,method,body,undefined,'lotus',login.data.token);
+  for(const path of ['/overview','/summary','/config','/doctors','/services','/blocks','/payments','/refunds','/outbox','/notifications','/audit-logs','/reconciliation']){
+   assert.equal((await admin(path)).status,200,path);
+  }
+  const service=await admin('/services','POST',{name:'Fixture',duration:25,fee:12300});
+  assert.equal(service.status,201);
+  const doctor=await admin('/doctors','POST',{name:'Fixture Doctor',schedule:{days:[2],start:9,end:16},serviceIds:[service.data.id]});
+  assert.equal(doctor.status,201);
+  assert.equal((await admin('/doctors/'+doctor.data.id+'/services')).data[0].id,service.data.id);
+  const hold=await f.verifiedHold();
+  const capture=await f.pay(hold.id);
+  const worker=new ReconciliationWorker(f.engine,f.payments,f.provider,{graceMs:0,maxAttempts:1});
+  await worker.runOnce();
+  const job=(await admin('/reconciliation')).data.find((item:{kind:string})=>item.kind==='CAPTURE');
+  assert.equal(job.status,'MANUAL');
+  const harbor=await f.request('/api/admin/login','POST',{email:'harbor@demo.invalid',password:'test-password-123'});
+  assert.equal((await f.request('/api/admin/reconciliation/'+job.id+'/requeue','POST',{reason:'Fixture'},undefined,'harbor',harbor.data.token)).status,404);
+  assert.equal((await admin('/reconciliation/'+job.id+'/requeue','POST',{reason:'Fixture'})).data.status,'PENDING');
+  assert.equal(f.engine.one('SELECT state FROM payments WHERE hold_id=?',hold.id)?.state,'CREATED');
+  await capture.verify();
+  assert.equal((await admin('/summary')).data.finance.verifiedPayments.amount,hold.fee);
  }finally{await f.close();}
 });
 test('Google adapter fails closed without credentials',async()=>{await assert.rejects(()=>new GoogleAdapter('','').getSlots({doctorId:'x',start:'2026-12-01T00:00:00Z',end:'2026-12-02T00:00:00Z'}),/Google Calendar credentials/);});
