@@ -26,8 +26,10 @@ Razorpay creates an INR order for the stored hold fee and reads the provider pay
 ## Outstanding risks
 
 - Raw patient holds, bookings and tools expose internal fields. Project explicit DTOs before sharing.
-- A callback can update stale state after awaited lookup. Provider order dedupe is in-memory and does not recover an upstream success without a local row. Use transactional conditional updates and durable reconciliation after approval.
-- Cancellation and reschedule can race across external calls. Replacement ownership and fee are checked, but replacement state is insufficiently restricted. Ambiguous adapter outcomes lack a recovery worker.
+- Payment capture rechecks payment and hold state under a SQLite write lock after provider lookup. Confirmation and expiry use the same lock. A confirmation claim protects the verified payment and pending appointment even after the original hold deadline.
+- The additive startup migration creates payment_order_attempts and booking_operations without rewriting existing rows. Legacy pending confirmation rows acquire a durable guard at startup. Back up the SQLite database and stop older API writers before upgrading.
+- Ambiguous orders and booking operations remain guarded across restart. Recovery is manual. Stop all API writers, confirm the outcome in authoritative provider records, and call reconcileOffline from apps/api/src/recovery.ts with verified evidence. Never clear a guard while the provider outcome is uncertain. No automatic reconciliation worker or provider refund execution exists.
+- A pending confirmation can occupy its appointment interval until reconciliation. Replacement holds are bounded to 24 hours. Resolve ambiguous moves promptly because a provider whose availability does not reflect the move can disagree with SQLite after that deadline.
 - Fixed Kolkata offset, one Google calendar per runtime, loopback-only bind, process-local rate limiting and no deployment/persistence smoke test. Health checks key presence, not provider readiness.
 - OTP is debugger-only and notification outbox is simulated. Never demo actual patient data.
 
