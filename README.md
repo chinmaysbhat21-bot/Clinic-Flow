@@ -15,3 +15,15 @@ Copy `.env.example` to `.env` locally and choose a development admin password. I
 - [HTTP examples](docs/examples/booking-flow.http)
 
 The local test suite uses a stateful mock clinic and a payment fixture. Shared integration is blocked on the remaining concurrency issues documented above. Chat is a stub. Use fictional data only.
+
+## Patient widget
+
+The patient-facing widget is in [`apps/widget`](apps/widget/README.md). To run its standalone preview:
+
+```powershell
+cd apps/widget
+npm.cmd install
+npm.cmd run dev
+```
+
+See the widget README for local embed examples and API setup instructions.
