@@ -33,6 +33,7 @@ Base URL is `http://127.0.0.1:4000`. Send `Content-Type: application/json` for J
 | `POST /api/admin/login` | public | IMPLEMENTED AND VERIFIED |
 | `GET /api/admin/appointments` | admin | IMPLEMENTED AND VERIFIED |
 | `GET /api/admin/overview` | admin | IMPLEMENTED BUT UNVERIFIED |
+| `GET /api/admin/reconciliation` | admin | IMPLEMENTED AND VERIFIED |
 | `GET /api/admin/config` | admin | IMPLEMENTED BUT UNVERIFIED |
 | `PATCH /api/admin/config` | admin | IMPLEMENTED BUT UNVERIFIED |
 | `GET /api/admin/doctors` | admin | IMPLEMENTED BUT UNVERIFIED |
@@ -52,6 +53,7 @@ Base URL is `http://127.0.0.1:4000`. Send `Content-Type: application/json` for J
 | `POST /mock/{clinic}/holds` | mock | IMPLEMENTED AND VERIFIED |
 | `POST /mock/{clinic}/patients` | mock | IMPLEMENTED AND VERIFIED |
 | `POST /mock/{clinic}/bookings/{id}/confirm` | mock | IMPLEMENTED AND VERIFIED |
+| `GET /mock/{clinic}/bookings/{id}` | mock | IMPLEMENTED AND VERIFIED |
 | `PATCH /mock/{clinic}/bookings/{id}` | mock | IMPLEMENTED AND VERIFIED |
 | `DELETE /mock/{clinic}/bookings/{id}` | mock | IMPLEMENTED AND VERIFIED |
 

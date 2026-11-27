@@ -2,13 +2,26 @@ import { randomUUID } from 'node:crypto';
 import { Engine,equal,requireThat,signature } from './core.js';
 import { transaction } from './db.js';
 import { remote } from './adapters.js';
-export interface PaymentProvider {keyId:string;secret:string;assertConfigured?():void;order(amount:number,receipt:string):Promise<{id:string;amount:number;currency:string}>;payment(id:string):Promise<{id:string;order_id:string;amount:number;currency:string;status:string}>}
+export interface PaymentProvider {keyId:string;secret:string;assertConfigured?():void;order(amount:number,receipt:string):Promise<{id:string;amount:number;currency:string}>;payment(id:string):Promise<{id:string;order_id:string;amount:number;currency:string;status:string}>;
+ findOrder?(receipt:string):Promise<{id:string;amount:number;currency:string;receipt:string}|null>;
+ findCapturedPayment?(orderId:string):Promise<string|null>;
+}
 export class RazorpayProvider implements PaymentProvider {
  constructor(public keyId:string,public secret:string){}
  assertConfigured(){requireThat(this.keyId.startsWith('rzp_test_')&&this.secret,'RAZORPAY_NOT_CONFIGURED','Razorpay test credentials required',503);}
  private request(path:string,body?:unknown){requireThat(this.keyId.startsWith('rzp_test_')&&this.secret,'RAZORPAY_NOT_CONFIGURED','Razorpay test credentials required',503);return remote(`https://api.razorpay.com/v1/${path}`,{method:body?'POST':'GET',headers:{Authorization:`Basic ${Buffer.from(`${this.keyId}:${this.secret}`).toString('base64')}`,'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined});}
  order(amount:number,receipt:string){return this.request('orders',{amount,currency:'INR',receipt});}
  payment(id:string){return this.request(`payments/${encodeURIComponent(id)}`);}
+ async findOrder(receipt:string){
+  const list=await this.request('orders?'+new URLSearchParams({receipt,count:'10'}));
+  const matches=list.items.filter((item:{receipt:string})=>item.receipt===receipt);
+  return matches.length===1?matches[0]:null;
+ }
+ async findCapturedPayment(orderId:string){
+  const list=await this.request(`orders/${encodeURIComponent(orderId)}/payments`);
+  const matches=list.items.filter((item:{order_id:string;status:string})=>item.order_id===orderId&&item.status==='captured');
+  return matches.length===1?matches[0].id:null;
+ }
 }
 export class Payments {
  constructor(private engine:Engine,private provider:PaymentProvider){}
@@ -30,6 +43,8 @@ export class Payments {
   const order=await this.provider.order(claim.amount,holdId);
   requireThat(order.id&&order.amount===claim.amount&&order.currency==='INR','PROVIDER_ORDER_MISMATCH');
   transaction(e.db,()=>{
+   const persisted=e.one('SELECT order_id FROM payments WHERE hold_id=?',holdId);
+   if(persisted){requireThat(persisted.order_id===order.id,'PROVIDER_ORDER_MISMATCH');return;}
    e.run('INSERT INTO payments VALUES(?,?,?,?,?,?,?,?,?)',randomUUID(),clinic,holdId,order.id,null,claim.amount,'INR','CREATED',e.now());
    e.run('DELETE FROM payment_order_attempts WHERE hold_id=?',holdId);
   });
@@ -37,7 +52,7 @@ export class Payments {
   return {keyId:this.provider.keyId,orderId:order.id,amount:claim.amount,currency:'INR'};
  }
  async verify(clinic:string,session:string,input:{holdId:string;razorpay_order_id:string;razorpay_payment_id:string;razorpay_signature:string}){requireThat(equal(signature(this.provider.secret,`${input.razorpay_order_id}|${input.razorpay_payment_id}`),input.razorpay_signature),'INVALID_PAYMENT_SIGNATURE');return this.reconcile(clinic,session,input.holdId,input.razorpay_order_id,input.razorpay_payment_id);}
- async reconcile(clinic:string,session:string,holdId:string,orderId:string,paymentId:string,failedEvent=false){
+ async reconcile(clinic:string,session:string,holdId:string,orderId:string,paymentId:string,failedEvent=false,canApply:()=>boolean=()=>true){
   const e=this.engine;
   e.hold(clinic,session,holdId,false);
   const read=()=>e.one('SELECT * FROM payments WHERE hold_id=? AND clinic_id=? AND order_id=?',holdId,clinic,orderId);
@@ -50,6 +65,7 @@ export class Payments {
   const provider=await this.provider.payment(paymentId);
   requireThat(provider.id===paymentId&&provider.order_id===orderId&&provider.amount===payment.amount&&provider.currency==='INR'&&(provider.status==='captured'||(failedEvent&&provider.status==='failed')),'PAYMENT_NOT_CAPTURED');
   return transaction(e.db,()=>{
+   requireThat(canApply(),'RECONCILIATION_LEASE_LOST');
    const current=read();
    requireThat(current,'PAYMENT_NOT_FOUND');
    if(['VERIFIED','REFUND_PENDING','REFUNDED'].includes(current.state)){

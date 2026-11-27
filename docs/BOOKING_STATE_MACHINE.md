@@ -2,6 +2,8 @@
 
 The combined shared BookingStatus enum contains AVAILABLE, HELD, OTP_VERIFIED, PAYMENT_PENDING, PAYMENT_VERIFIED, CONFIRMATION_PENDING, CONFIRMED, EXPIRED, CANCELLED, PAYMENT_FAILED, REFUND_PENDING and REFUNDED. PaymentStatus contains CREATED, VERIFIED, FAILED, REFUND_PENDING and REFUNDED. Enum membership does not imply a reachable stored state.
 
+Reconciliation jobs have internal PENDING, RUNNING, DONE and MANUAL states. A lease expiry permits another worker to retry a provider lookup. Applying verified evidence uses the existing booking or payment transition. A pending reschedule guard quarantines the replacement slot after its hold expires and until authoritative evidence resolves the operation. The worker does not release reservations on retry exhaustion.
+
 ```mermaid
 stateDiagram-v2
   [*] --> AVAILABLE

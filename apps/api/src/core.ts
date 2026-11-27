@@ -26,7 +26,9 @@ export class Engine {
  if(t<=this.now())continue;
  if(this.one('SELECT 1 FROM blocks WHERE clinic_id=? AND (doctor_id IS NULL OR doctor_id=?) AND start<? AND end>?',clinic,doctorId,end,start))continue;
  if(this.one("SELECT 1 FROM appointments WHERE doctor_id=? AND state IN ('CONFIRMED','CONFIRMATION_PENDING') AND start<? AND end>?",doctorId,end,start))continue;
- if(this.one("SELECT 1 FROM holds WHERE doctor_id=? AND state NOT IN ('CANCELLED','EXPIRED','CONFIRMED') AND expires_at>? AND start<? AND end>?",doctorId,this.now(),end,start))continue;
+ if(this.one(`SELECT 1 FROM holds h WHERE doctor_id=? AND start<? AND end>?
+  AND ((state NOT IN ('CANCELLED','EXPIRED','CONFIRMED') AND expires_at>?)
+    OR EXISTS (SELECT 1 FROM booking_operations WHERE replacement_id=h.id))`,doctorId,end,start,this.now()))continue;
  slots.push({start,end});}return slots;
  }
  async available(clinic:string,doctor:string,service:string,date:string){const local=this.slots(clinic,doctor,service,date);if(!local.length)return [];
@@ -63,7 +65,7 @@ export class Engine {
  requireThat(a,'HOLD_EXPIRED');
  if(a.state==='CONFIRMED')return a;
  try{const patient=this.one('SELECT * FROM patients WHERE id=?',a.patient_id)!;const adapter=this.adapters(clinic);const patientId=await adapter.findOrCreatePatient({id:patient.id,phone:patient.phone});const external=await adapter.confirmBooking({id,doctorId:a.doctor_id,start:a.start,end:a.end,patientId});
- transaction(this.db,()=>{this.run("UPDATE appointments SET state='CONFIRMED',external_id=? WHERE id=?",external,a.id);this.run("UPDATE holds SET state='CONFIRMED' WHERE id=?",id);this.notify(clinic,a.id,'CONFIRMATION');this.audit(clinic,'BOOKING_CONFIRMED',a.id);this.run('DELETE FROM booking_operations WHERE booking_key=?',id);});return this.booking(clinic,session,a.id);
+ transaction(this.db,()=>{if(!this.one("SELECT booking_key FROM booking_operations WHERE booking_key=? AND kind='CONFIRM'",id))return;this.run("UPDATE appointments SET state='CONFIRMED',external_id=? WHERE id=?",external,a.id);this.run("UPDATE holds SET state='CONFIRMED' WHERE id=?",id);this.notify(clinic,a.id,'CONFIRMATION');this.audit(clinic,'BOOKING_CONFIRMED',a.id);this.run('DELETE FROM booking_operations WHERE booking_key=?',id);});return this.booking(clinic,session,a.id);
  }catch{throw new Fault('CONFIRMATION_PENDING','Payment retained; retry confirmation with the same hold ID',503);}
  }
  notify(clinic:string,id:string,kind:string){this.run('INSERT OR IGNORE INTO outbox VALUES(?,?,?,?,?,?,?,?)',randomUUID(),clinic,id,kind,null,JSON.stringify({bookingId:id}),'SIMULATED',null);}
@@ -79,6 +81,7 @@ export class Engine {
   if(a.state!=='CONFIRMED')return a;
   await this.adapters(clinic).cancelBooking(a.external_id);
   return transaction(this.db,()=>{
+   if(!this.one("SELECT booking_key FROM booking_operations WHERE booking_key=? AND kind='CANCEL'",a.hold_id))return this.booking(clinic,session,id);
    const refundable=Date.parse(a.start)-this.now()>=this.clinic(clinic).config.refundCutoffHours*3600000;
    this.run('UPDATE appointments SET state=? WHERE id=?',refundable?'REFUND_PENDING':'CANCELLED',id);
    if(refundable)this.run("UPDATE payments SET state='REFUND_PENDING' WHERE hold_id=?",a.hold_id);
@@ -108,6 +111,7 @@ export class Engine {
   try{await this.adapters(clinic).rescheduleBooking(a.external_id,{doctorId:h.doctor_id,start:h.start,end:h.end});}
   catch{throw new Fault('RESCHEDULE_PENDING','Original booking retained; replacement retained for reconciliation',503);}
   return transaction(this.db,()=>{
+   if(!this.one("SELECT booking_key FROM booking_operations WHERE booking_key=? AND kind='RESCHEDULE' AND replacement_id=?",a.hold_id,holdId))return this.booking(clinic,session,id);
    this.run('UPDATE appointments SET start=?,end=? WHERE id=?',h.start,h.end,id);
    this.run("UPDATE holds SET state='CONFIRMED' WHERE id=?",holdId);
    this.notify(clinic,id,`RESCHEDULE_${holdId}`);

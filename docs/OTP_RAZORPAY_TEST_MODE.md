@@ -19,7 +19,7 @@ Use trusted session context to prompt the widget to request OTP and initiate che
 
 Startup adds the `payment_webhook_events` table without rewriting existing data. Authenticated event IDs and body digests deduplicate deliveries. Transient processing failures leave the event retryable. Concurrent deliveries and client callbacks share Phase 2's atomic payment transitions. Retain events for debugging and agree an archival policy before shared operation.
 
-Ambiguous order and booking outcomes still require manual provider reconciliation. Resolve a pending move before its replacement hold expires. A future worker should inspect provider records and release guards only on authoritative evidence, starting with ambiguous reschedules. Separate future work can add retryable notification delivery and provider-confirmed, idempotent refund execution.
+The reconciliation worker looks for authoritative order and booking evidence. Ambiguous cases without sufficient evidence require manual review. A pending move keeps its replacement slot quarantined after hold expiry. See [backend integration](BACKEND_INTEGRATION.md) for operations and recovery.
 
 ## Verified Test Mode checkout
 
