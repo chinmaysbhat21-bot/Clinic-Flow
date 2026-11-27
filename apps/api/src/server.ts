@@ -26,34 +26,63 @@ export function createApp(db:DB,options:{mockBase?:string;mockKey:string;webhook
  app.use((req,res,next)=>{res.locals.requestId=randomUUID();res.setHeader('Cache-Control','no-store');res.setHeader('X-Content-Type-Options','nosniff');const origin=req.headers.origin;if(origin){if(!(options.origins??['http://localhost:5173','http://localhost:5174']).includes(origin))return next(new Fault('ORIGIN_NOT_ALLOWED','Origin not allowed',403));res.setHeader('Access-Control-Allow-Origin',origin);res.setHeader('Vary','Origin');res.setHeader('Access-Control-Allow-Headers','Content-Type, Authorization, X-Clinic-Id, X-Session-Id');res.setHeader('Access-Control-Allow-Methods','GET,POST,PATCH,DELETE,OPTIONS');}if(req.method==='OPTIONS'){res.sendStatus(204);return;}next();});
  const limits=new Map<string,{count:number;reset:number}>();app.use((req,res,next)=>{const key=req.socket.remoteAddress??'unknown',now=Date.now();if(limits.size>10000)for(const [k,v] of limits)if(v.reset<now)limits.delete(k);let value=limits.get(key);if(!value||value.reset<now){value={count:0,reset:now+60000};limits.set(key,value);}if(++value.count>120)return next(new Fault('RATE_LIMIT','Try again later',429));next();});
  const ok=(res:Response,data:unknown,status=200)=>res.status(status).json({ok:true,data,requestId:res.locals.requestId});
- app.post('/api/payments/webhook',express.raw({type:'application/json',limit:'64kb',inflate:false}),async(req,res)=>{
+ const providerId=z.string().min(1).max(128).regex(/^[A-Za-z0-9_-]+$/);
+ const paymentEntity=z.object({id:providerId,order_id:providerId});
+ const refundEntity=z.object({id:providerId,payment_id:providerId});
+ app.post('/api/payments/webhook',express.raw({type:'application/json',limit:'64kb',inflate:false}),async(req:Request,res:Response)=>{
   const secret=options.webhookSecret??process.env.RAZORPAY_WEBHOOK_SECRET;
-  requireThat(secret,'WEBHOOK_NOT_CONFIGURED',undefined,503);
-  requireThat(Buffer.isBuffer(req.body)&&equal(signature(secret,req.body),String(req.headers['x-razorpay-signature']??'')),'INVALID_WEBHOOK_SIGNATURE');
+  requireThat(secret?.trim()&&!equal(secret,provider.secret),'WEBHOOK_NOT_CONFIGURED',undefined,503);
+  const provided=req.get('x-razorpay-signature')??'';
+  requireThat(Buffer.isBuffer(req.body)&&/^[0-9a-f]{64}$/i.test(provided)&&
+   equal(signature(secret!,req.body),provided.toLowerCase()),'INVALID_WEBHOOK_SIGNATURE');
   const hash=createHash('sha256').update(req.body).digest('hex');
   const eventId=req.get('x-razorpay-event-id')??hash;
+  requireThat(/^[A-Za-z0-9_-]{1,128}$/.test(eventId),'INVALID_WEBHOOK');
   let parsed:unknown;
   try {parsed=JSON.parse(req.body.toString('utf8'));} catch {throw new Fault('INVALID_WEBHOOK','Invalid webhook JSON');}
-  const body=z.object({event:z.string(),payload:z.unknown().optional()}).parse(parsed);
-  const prior=transaction(db,()=>{
-   engine.run('INSERT OR IGNORE INTO payment_webhook_events VALUES(?,?,NULL)',eventId,hash);
-   return engine.one('SELECT * FROM payment_webhook_events WHERE id=?',eventId)!;
-  });
-  requireThat(prior.body_hash===hash,'INVALID_WEBHOOK');
-  if(prior.processed_at===null){
-   if(body.event==='payment.captured'||body.event==='payment.failed'){
-    const payload=z.object({payment:z.object({entity:z.object({id:z.string().min(1),order_id:z.string().min(1)})})}).parse(body.payload);
-    const payment=payload.payment.entity;
-    const row=engine.one('SELECT p.*,h.session_id FROM payments p JOIN holds h ON h.id=p.hold_id WHERE p.order_id=?',payment.order_id);
-    requireThat(row,'PAYMENT_NOT_FOUND');
-    await payments.reconcile(row.clinic_id,row.session_id,row.hold_id,row.order_id,payment.id,body.event==='payment.failed');
-   } else if(['refund.created','refund.processed','refund.failed','refund.speed_changed'].includes(body.event)){
-    const payload=z.object({refund:z.object({entity:z.object({id:z.string().min(1),payment_id:z.string().min(1)})})}).parse(body.payload);
-    await refunds.webhook(payload.refund.entity.payment_id,payload.refund.entity.id);
-   }
-   engine.run('UPDATE payment_webhook_events SET processed_at=? WHERE id=? AND processed_at IS NULL',engine.now(),eventId);
+  const body=z.object({event:z.string().min(1).max(128),payload:z.unknown().optional()}).parse(parsed);
+  let paymentId:string|null=null,orderId:string|null=null,refundId:string|null=null;
+  if(['payment.captured','payment.failed','order.paid'].includes(body.event)){
+   const payload=z.object({payment:z.object({entity:paymentEntity}),order:z.object({entity:z.object({id:providerId})}).optional()}).parse(body.payload);
+   paymentId=payload.payment.entity.id;
+   orderId=payload.payment.entity.order_id;
+   if(body.event==='order.paid')requireThat(payload.order?.entity.id===orderId,'INVALID_WEBHOOK');
+  }else if(['refund.created','refund.processed','refund.failed','refund.speed_changed'].includes(body.event)){
+   const {refund}=z.object({refund:z.object({entity:refundEntity})}).parse(body.payload);
+   paymentId=refund.entity.payment_id;
+   refundId=refund.entity.id;
+  }
+  try{
+   transaction(db,()=>{
+    const prior=engine.one('SELECT body_hash,processed_at,event_type FROM payment_webhook_events WHERE id=?',eventId);
+    if(prior)requireThat(prior.body_hash===hash,'INVALID_WEBHOOK');
+    if(prior&&(prior.processed_at!==null||prior.event_type!==null))return;
+    const now=engine.now();
+    let clinicId:string|undefined;
+    if(paymentId){
+     const row=orderId
+      ? engine.one('SELECT p.clinic_id FROM payments p JOIN holds h ON h.id=p.hold_id AND h.clinic_id=p.clinic_id WHERE p.order_id=?',orderId)
+      : engine.one('SELECT p.clinic_id FROM payments p JOIN holds h ON h.id=p.hold_id AND h.clinic_id=p.clinic_id WHERE p.payment_id=?',paymentId);
+     requireThat(row,'WEBHOOK_PAYMENT_UNMAPPED','Webhook payment mapping is not available',503);
+     clinicId=String(row.clinic_id);
+    }
+    engine.run(`INSERT INTO payment_webhook_events(id,body_hash,processed_at,event_type,payment_id,order_id,refund_id)
+     VALUES(?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET processed_at=excluded.processed_at,
+     event_type=excluded.event_type,payment_id=excluded.payment_id,order_id=excluded.order_id,refund_id=excluded.refund_id`,
+     eventId,hash,paymentId?null:now,body.event,paymentId,orderId,refundId);
+    if(clinicId)engine.run(`INSERT INTO reconciliation_jobs(id,clinic_id,kind,operation_ref,generation,next_at)
+     VALUES(?,?,'WEBHOOK',?,0,?)`,randomUUID(),clinicId,eventId,now);
+   });
+  }catch(error){
+   if(error instanceof Fault)throw error;
+   throw new Fault('WEBHOOK_PERSISTENCE_UNAVAILABLE','Webhook storage is unavailable',503);
   }
   ok(res,{received:true});
+ },(err:unknown,_req:Request,_res:Response,next:NextFunction)=>{
+  const type=(err as {type?:string})?.type;
+  if(type==='entity.too.large')return next(new Fault('WEBHOOK_BODY_TOO_LARGE','Webhook body exceeds 64 KiB',413));
+  if(type==='encoding.unsupported')return next(new Fault('WEBHOOK_ENCODING_UNSUPPORTED','Webhook body must be uncompressed',415));
+  next(err);
  });
  app.use(express.json({limit:'32kb'}));
  app.get('/api/health',(_req,res)=>{db.prepare('SELECT 1').get();ok(res,{database:'sqlite',status:'ok',otp:'DEVELOPMENT_ONLY',notifications:'SIMULATED',googleConfigured:!!process.env.GOOGLE_ACCESS_TOKEN,razorpayConfigured:!!process.env.RAZORPAY_KEY_ID});});
@@ -147,6 +176,7 @@ export function createApp(db:DB,options:{mockBase?:string;mockKey:string;webhook
   WHERE j.clinic_id=? AND j.status<>'DONE' AND (
    (j.kind='ORDER' AND EXISTS (SELECT 1 FROM payment_order_attempts t WHERE t.hold_id=j.operation_ref AND t.started_at=j.generation))
    OR (j.kind='CAPTURE' AND EXISTS (SELECT 1 FROM payments p WHERE p.hold_id=j.operation_ref AND p.state IN ('CREATED','FAILED')))
+   OR j.kind='WEBHOOK'
    OR (j.kind='REFUND' AND EXISTS (SELECT 1 FROM payments p WHERE p.hold_id=j.operation_ref AND p.state='REFUND_PENDING'))
    OR EXISTS (SELECT 1 FROM booking_operations o WHERE o.booking_key=j.operation_ref AND o.kind=j.kind AND o.started_at=j.generation)
   ) ORDER BY j.next_at LIMIT 200

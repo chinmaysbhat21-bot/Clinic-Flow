@@ -122,6 +122,7 @@ export function buildAdminSummary(engine:Engine,clinicId:string){
   WHERE j.clinic_id=? AND j.status<>'DONE' AND (
    (j.kind='ORDER' AND EXISTS (SELECT 1 FROM payment_order_attempts t WHERE t.hold_id=j.operation_ref AND t.started_at=j.generation))
    OR (j.kind='CAPTURE' AND EXISTS (SELECT 1 FROM payments p WHERE p.hold_id=j.operation_ref AND p.state IN ('CREATED','FAILED')))
+   OR j.kind='WEBHOOK'
    OR (j.kind='REFUND' AND EXISTS (SELECT 1 FROM payments p WHERE p.hold_id=j.operation_ref AND p.state='REFUND_PENDING'))
    OR EXISTS (SELECT 1 FROM booking_operations o WHERE o.booking_key=j.operation_ref AND o.kind=j.kind AND o.started_at=j.generation)
   )`,clinicId);
@@ -189,6 +190,17 @@ export async function resolveReconciliation(engine:Engine,payments:Payments,prov
  requireThat(job,'NOT_FOUND','Reconciliation job not found',404);
  requireThat(job.status==='MANUAL','INVALID_STATE','Only manual reconciliation jobs can be changed');
  const ref=String(job.operation_ref),kind=String(job.kind),gen=Number(job.generation),now=engine.now();
+ if(kind==='WEBHOOK'){
+  requireThat(input.action==='REQUEUE','INVALID_STATE','Webhook jobs require worker reconciliation');
+  return transaction(engine.db,()=>{
+   const changed=engine.run(`UPDATE reconciliation_jobs SET status='PENDING',attempts=0,next_at=?,last_error=NULL
+    WHERE id=? AND clinic_id=? AND status='MANUAL' AND EXISTS(
+     SELECT 1 FROM payment_webhook_events w WHERE w.id=reconciliation_jobs.operation_ref AND w.event_type IS NOT NULL AND w.processed_at IS NULL)`,now,jobId,clinicId);
+   requireThat(changed.changes,'INVALID_STATE','Webhook is no longer pending');
+   engine.auditDetails(clinicId,'MANUAL_RECONCILIATION_REQUEUED',jobId,adminId,{kind,reasonProvided:true});
+   return {jobId,kind,status:'PENDING',resolution:'REQUEUED'};
+  });
+ }
  const hold=engine.one('SELECT * FROM holds WHERE id=? AND clinic_id=?',ref,clinicId);
  requireThat(hold,'NOT_FOUND','Referenced hold not found',404);
 

@@ -19,7 +19,7 @@ if(!Number.isSafeInteger(pollMs)||pollMs<1000||pollMs>60000)throw new Error('REC
 const db=openDb(process.env.DATABASE_PATH??'data/clinic.db');seed(db,process.env.ADMIN_PASSWORD);
 if(!process.env.ADMIN_PASSWORD)console.warn('ADMIN_PASSWORD absent: demo administrators are not provisioned. Set it before first seed.');
 const {app,engine,payments,provider,refunds}=createApp(db,{mockKey:process.env.MOCK_API_KEY??randomBytes(32).toString('hex'),mockBase:process.env.MOCK_BASE_URL,origins:process.env.ALLOWED_ORIGINS?.split(','),otpSink:otpDelivery?.deliver.bind(otpDelivery)});
-const worker=new ReconciliationWorker(engine,payments,provider,{pollMs},message=>console.log(message));
+const worker=new ReconciliationWorker(engine,payments,provider,{pollMs},message=>console.log(message),refunds);
 const notifications=notificationProvider?new NotificationWorker(db,notificationProvider,{pollMs:notificationPollMs},undefined,message=>console.log(message)):undefined;
 const timer=setInterval(()=>{
  const now=Date.now();

@@ -80,6 +80,10 @@ export function openDb(path:string){
  WHERE a.state='CONFIRMATION_PENDING';
  `);
  transaction(db,()=>{
+ ensureColumn(db,'payment_webhook_events','event_type','TEXT');
+ ensureColumn(db,'payment_webhook_events','payment_id','TEXT');
+ ensureColumn(db,'payment_webhook_events','order_id','TEXT');
+ ensureColumn(db,'payment_webhook_events','refund_id','TEXT');
  ensureColumn(db,'notification_preferences','email_destination_hash','TEXT');
  ensureColumn(db,'admins','role',"TEXT NOT NULL DEFAULT 'OWNER'");
  ensureColumn(db,'admin_sessions','admin_id','TEXT REFERENCES admins(id)');
