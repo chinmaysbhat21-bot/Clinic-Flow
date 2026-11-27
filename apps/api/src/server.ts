@@ -1,4 +1,5 @@
 import express,{type Request,type Response,type NextFunction} from 'express';
+import { channels } from './notification-outbox.js';
 import { randomUUID,randomBytes,createHash,scryptSync } from 'node:crypto';
 import { z } from 'zod';
 import * as contracts from '../../../packages/shared/src/index.js';
@@ -79,10 +80,30 @@ export function createApp(db:DB,options:{mockBase?:string;mockKey:string;webhook
  app.post('/api/admin/services',(req,res)=>{const s=service.parse(req.body),id=randomUUID();engine.run('INSERT INTO services VALUES(?,?,?,?,?,?)',id,res.locals.clinic,s.name,s.duration,s.fee,Number(s.active));ok(res,{id},201);});
  app.patch('/api/admin/services/:id',(req,res)=>{const p=service.partial().parse(req.body),id=String(req.params.id),s=engine.one('SELECT * FROM services WHERE id=? AND clinic_id=?',id,res.locals.clinic);requireThat(s,'NOT_FOUND',undefined,404);engine.run('UPDATE services SET name=?,duration=?,fee=?,active=? WHERE id=?',p.name??s.name,p.duration??s.duration,p.fee??s.fee,p.active===undefined?s.active:Number(p.active),id);ok(res,{id});});
  app.post('/api/admin/blocks',(req,res)=>{const p=z.object({doctorId:z.string().optional(),start:z.iso.datetime(),end:z.iso.datetime(),reason:z.string().max(100)}).refine(s=>s.end>s.start).parse(req.body);if(p.doctorId)requireThat(engine.one('SELECT id FROM doctors WHERE id=? AND clinic_id=?',p.doctorId,res.locals.clinic),'INVALID_DOCTOR');const id=randomUUID();engine.run('INSERT INTO blocks VALUES(?,?,?,?,?,?)',id,res.locals.clinic,p.doctorId??null,p.start,p.end,p.reason);ok(res,{id},201);});
- for(const [path,table] of [['payments','payments'],['audit-logs','audit'],['outbox','outbox'],['blocks','blocks']])app.get(`/api/admin/${path}`,(_req,res)=>ok(res,engine.all(`SELECT * FROM ${table} WHERE clinic_id=? LIMIT 200`,res.locals.clinic)));
+ for(const [path,table] of [['payments','payments'],['audit-logs','audit'],['blocks','blocks']])app.get(`/api/admin/${path}`,(_req,res)=>ok(res,engine.all(`SELECT * FROM ${table} WHERE clinic_id=? LIMIT 200`,res.locals.clinic)));
+ app.get('/api/admin/outbox',(_req,res)=>ok(res,engine.all(`
+  SELECT o.id,o.clinic_id,o.appointment_id,o.kind,NULL AS destination,o.payload,
+   COALESCE(j.status,o.status) AS status,j.last_error AS error
+  FROM outbox o LEFT JOIN notification_jobs j ON j.id=o.id WHERE o.clinic_id=? LIMIT 200
+ `,res.locals.clinic)));
+ app.get('/api/admin/notifications',(_req,res)=>ok(res,engine.all(`
+  SELECT j.id,j.event,j.channel,j.status,j.attempts,j.scheduled_at AS scheduledAt,
+   CASE WHEN j.status='PENDING' THEN j.next_at ELSE NULL END AS nextAttemptAt,
+   j.last_error AS reason,a.reference AS bookingReference
+  FROM notification_jobs j JOIN outbox o ON o.id=j.id
+  LEFT JOIN appointments a ON a.id=o.appointment_id AND a.clinic_id=o.clinic_id
+  WHERE o.clinic_id=? ORDER BY j.scheduled_at DESC,j.id LIMIT 200
+ `,res.locals.clinic)));
  app.post('/api/admin/appointments/:id/:action',async(req,res)=>{const a=engine.one('SELECT * FROM appointments WHERE id=? AND clinic_id=?',String(req.params.id),res.locals.clinic);requireThat(a,'NOT_FOUND',undefined,404);if(req.params.action==='cancel')ok(res,adminAppointment(await engine.cancel(a.clinic_id,a.session_id,a.id)));else if(req.params.action==='reschedule'){const p=contracts.holdRequest.parse(req.body);const start=new Date(p.start).toISOString();if(a.state==='CONFIRMED'&&a.start===start&&a.doctor_id===p.doctorId&&a.service_id===p.serviceId){ok(res,adminAppointment(a));return;}requireThat(!engine.one('SELECT booking_key FROM booking_operations WHERE booking_key=?',a.hold_id),'RESCHEDULE_PENDING','Booking operation pending reconciliation',503);const h=await engine.reserve(a.clinic_id,a.session_id,p);ok(res,adminAppointment(await engine.reschedule(a.clinic_id,a.session_id,a.id,h.id)));}else throw new Fault('NOT_FOUND','Unknown action',404);});
  app.use('/api',(req,res,next)=>{const clinic=String(req.headers['x-clinic-id']??''),session=String(req.headers['x-session-id']??'');const s=engine.one('SELECT * FROM sessions WHERE id=? AND clinic_id=? AND expires_at>?',session,clinic,engine.now());if(!s)return next(new Fault('SESSION_REQUIRED','Valid clinic session headers required',401));res.locals.clinic=clinic;res.locals.session=session;next();});
  app.post('/api/consent',(req,res)=>{const p=contracts.consentRequest.parse(req.body);engine.run('INSERT INTO consents VALUES(?,?,?,?,?,?)',randomUUID(),res.locals.session,res.locals.clinic,1,Number(p.briefing),engine.now());ok(res,{recorded:true});});
+ app.post('/api/notification-preferences',(req,res)=>{
+  const p=z.object({enabled:z.boolean(),channel:z.enum(channels).default('CONSOLE'),language:contracts.language.default('en')}).strict().parse(req.body);
+  engine.run(`INSERT INTO notification_preferences VALUES(?,?,?,?,?)
+   ON CONFLICT(session_id) DO UPDATE SET enabled=excluded.enabled,channel=excluded.channel,language=excluded.language
+   WHERE notification_preferences.clinic_id=excluded.clinic_id`,res.locals.session,res.locals.clinic,Number(p.enabled),p.channel,p.language);
+  ok(res,p);
+ });
  app.get('/api/slots',async(req,res)=>{const p=contracts.slotQuery.parse(req.query);ok(res,await engine.available(res.locals.clinic,p.doctorId,p.serviceId,p.date));});
  app.post('/api/holds',async(req,res)=>ok(res,await engine.reserve(res.locals.clinic,res.locals.session,contracts.holdRequest.parse(req.body)),201));
  app.delete('/api/holds/:id',(req,res)=>{transaction(db,()=>{const h=engine.hold(res.locals.clinic,res.locals.session,String(req.params.id),false);requireThat(['HELD','OTP_VERIFIED','EXPIRED','CANCELLED'].includes(h.state),'INVALID_STATE');engine.run("UPDATE holds SET state='CANCELLED' WHERE id=?",h.id);});ok(res,{state:'CANCELLED'});});

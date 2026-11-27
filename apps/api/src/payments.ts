@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { Engine,equal,requireThat,signature } from './core.js';
 import { transaction } from './db.js';
 import { remote } from './adapters.js';
+import { enqueuePaymentNotice } from './notification-outbox.js';
 export interface PaymentProvider {keyId:string;secret:string;assertConfigured?():void;order(amount:number,receipt:string):Promise<{id:string;amount:number;currency:string}>;payment(id:string):Promise<{id:string;order_id:string;amount:number;currency:string;status:string}>;
  findOrder?(receipt:string):Promise<{id:string;amount:number;currency:string;receipt:string}|null>;
  findCapturedPayment?(orderId:string):Promise<string|null>;
@@ -80,6 +81,7 @@ export class Payments {
    const eligible=hold.state==='PAYMENT_PENDING'&&hold.expires_at>e.now();
    e.run('UPDATE payments SET state=?,payment_id=? WHERE id=?',eligible?'VERIFIED':'REFUND_PENDING',paymentId,current.id);
    if(eligible)e.run("UPDATE holds SET state='PAYMENT_VERIFIED' WHERE id=?",holdId);
+   enqueuePaymentNotice(e.db,holdId,eligible?'PAYMENT_CONFIRMED':'REFUND_PENDING',e.now());
    e.audit(clinic,eligible?'PAYMENT_VERIFIED':'LATE_PAYMENT_RECONCILIATION',current.id);
    return {state:eligible?'PAYMENT_VERIFIED':'REFUND_PENDING'};
   });

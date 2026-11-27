@@ -14,6 +14,7 @@ Base URL is `http://127.0.0.1:4000`. Send `Content-Type: application/json` for J
 | `GET /api/clinics/{id}/doctors` | public | IMPLEMENTED BUT UNVERIFIED |
 | `GET /api/clinics/{id}/services` | public | IMPLEMENTED BUT UNVERIFIED |
 | `POST /api/consent` | patient | IMPLEMENTED AND VERIFIED |
+| `POST /api/notification-preferences` | patient | IMPLEMENTED AND VERIFIED |
 | `GET /api/slots` | patient | IMPLEMENTED AND VERIFIED |
 | `POST /api/holds` | patient | IMPLEMENTED AND VERIFIED |
 | `GET /api/holds/{id}` | patient | IMPLEMENTED BUT UNVERIFIED |
@@ -34,6 +35,7 @@ Base URL is `http://127.0.0.1:4000`. Send `Content-Type: application/json` for J
 | `GET /api/admin/appointments` | admin | IMPLEMENTED AND VERIFIED |
 | `GET /api/admin/overview` | admin | IMPLEMENTED BUT UNVERIFIED |
 | `GET /api/admin/reconciliation` | admin | IMPLEMENTED AND VERIFIED |
+| `GET /api/admin/notifications` | admin | IMPLEMENTED AND VERIFIED |
 | `GET /api/admin/config` | admin | IMPLEMENTED BUT UNVERIFIED |
 | `PATCH /api/admin/config` | admin | IMPLEMENTED BUT UNVERIFIED |
 | `GET /api/admin/doctors` | admin | IMPLEMENTED BUT UNVERIFIED |

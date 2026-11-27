@@ -2,6 +2,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { randomUUID,scryptSync } from 'node:crypto';
+import { enqueuePaymentNotice } from './notification-outbox.js';
 export function openDb(path:string){
  if(path!==':memory:')mkdirSync(dirname(path),{recursive:true});
  const db=new DatabaseSync(path); db.exec('PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;');
@@ -41,6 +42,18 @@ export function openDb(path:string){
  CREATE TABLE IF NOT EXISTS appointments(id TEXT PRIMARY KEY,reference TEXT UNIQUE NOT NULL,clinic_id TEXT NOT NULL,session_id TEXT NOT NULL,hold_id TEXT UNIQUE NOT NULL,doctor_id TEXT NOT NULL,service_id TEXT NOT NULL,patient_id TEXT NOT NULL,start TEXT NOT NULL,end TEXT NOT NULL,state TEXT NOT NULL,external_id TEXT,created_at INTEGER NOT NULL);
  CREATE INDEX IF NOT EXISTS appointments_overlap ON appointments(doctor_id,start,end,state);
  CREATE TABLE IF NOT EXISTS outbox(id TEXT PRIMARY KEY,clinic_id TEXT NOT NULL,appointment_id TEXT,kind TEXT NOT NULL,destination TEXT,payload TEXT NOT NULL,status TEXT NOT NULL,error TEXT,UNIQUE(appointment_id,kind));
+ CREATE TABLE IF NOT EXISTS notification_preferences(
+  session_id TEXT PRIMARY KEY REFERENCES sessions(id), clinic_id TEXT NOT NULL REFERENCES clinics(id),
+  enabled INTEGER NOT NULL CHECK(enabled IN (0,1)), channel TEXT NOT NULL, language TEXT NOT NULL
+ );
+ CREATE TABLE IF NOT EXISTS notification_jobs(
+  id TEXT PRIMARY KEY REFERENCES outbox(id), event_key TEXT NOT NULL UNIQUE,
+  hold_id TEXT NOT NULL REFERENCES holds(id), event TEXT NOT NULL, channel TEXT,
+  expected_start TEXT, scheduled_at INTEGER NOT NULL, next_at INTEGER NOT NULL,
+  status TEXT NOT NULL DEFAULT 'PENDING', attempts INTEGER NOT NULL DEFAULT 0,
+  lease_token TEXT, lease_until INTEGER, provider_key TEXT, last_error TEXT
+ );
+ CREATE INDEX IF NOT EXISTS notification_due ON notification_jobs(status,next_at,lease_until);
  CREATE TABLE IF NOT EXISTS briefings(appointment_id TEXT PRIMARY KEY,clinic_id TEXT NOT NULL,summary TEXT NOT NULL,created_at INTEGER NOT NULL);
  CREATE TABLE IF NOT EXISTS audit(id TEXT PRIMARY KEY,clinic_id TEXT NOT NULL,action TEXT NOT NULL,entity_id TEXT NOT NULL,created_at INTEGER NOT NULL);
  CREATE TABLE IF NOT EXISTS mock_patients(id TEXT PRIMARY KEY,clinic_id TEXT NOT NULL,phone TEXT NOT NULL,UNIQUE(clinic_id,phone));
@@ -59,7 +72,8 @@ export function expireHolds(db:DB, now:number, holdId?:string) {
   AND NOT EXISTS (SELECT 1 FROM booking_operations WHERE booking_key=holds.id OR replacement_id=holds.id)
   AND NOT EXISTS (SELECT 1 FROM appointments WHERE hold_id=holds.id)`;
  const args = [now, holdId ?? null, holdId ?? null] as const;
- db.prepare(`UPDATE payments SET state='REFUND_PENDING' WHERE state='VERIFIED' AND hold_id IN (${eligible})`).run(...args);
+ const expired=db.prepare(`UPDATE payments SET state='REFUND_PENDING' WHERE state='VERIFIED' AND hold_id IN (${eligible}) RETURNING hold_id`).all(...args);
+ for(const payment of expired)enqueuePaymentNotice(db,String(payment.hold_id),'REFUND_PENDING',now);
  db.prepare(`UPDATE holds SET state='EXPIRED' WHERE id IN (${eligible})`).run(...args);
 }
 export function transaction<T>(db:DB,fn:()=>T):T {db.exec('BEGIN IMMEDIATE');try{const result=fn();db.exec('COMMIT');return result;}catch(e){db.exec('ROLLBACK');throw e;}}

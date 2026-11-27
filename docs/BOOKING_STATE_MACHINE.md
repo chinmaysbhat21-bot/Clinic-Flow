@@ -4,6 +4,8 @@ The combined shared BookingStatus enum contains AVAILABLE, HELD, OTP_VERIFIED, P
 
 Reconciliation jobs have internal PENDING, RUNNING, DONE and MANUAL states. A lease expiry permits another worker to retry a provider lookup. Applying verified evidence uses the existing booking or payment transition. A pending reschedule guard quarantines the replacement slot after its hold expires and until authoritative evidence resolves the operation. The worker does not release reservations on retry exhaustion.
 
+Verified booking and payment transitions enqueue durable notification jobs in the same transaction. The worker rechecks consent and state before dispatch. Moving or cancelling a booking invalidates the old reminder schedule. Notification states are separate from booking and payment states. See [notification setup](NOTIFICATION_SETUP.md).
+
 ```mermaid
 stateDiagram-v2
   [*] --> AVAILABLE

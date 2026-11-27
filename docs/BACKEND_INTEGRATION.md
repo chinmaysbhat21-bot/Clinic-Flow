@@ -13,6 +13,7 @@ Express routes validate with Zod and call Engine or Payments. Engine owns SQLite
 | RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET | Test-only order and capture lookup credentials; use rzp_test_ key |
 | RAZORPAY_WEBHOOK_SECRET | Optional signed capture webhook; use raw request body |
 | GOOGLE_ACCESS_TOKEN, GOOGLE_CALENDARS_JSON, GOOGLE_CALENDAR_ID | Scoped OAuth demo token and clinic-specific calendar map. Legacy ID applies only to Harbor. See [Google Calendar setup](GOOGLE_CALENDAR_SETUP.md). |
+| NOTIFICATION_MODE, NOTIFICATION_POLL_MS, NOTIFICATION_REMINDER_MINUTES | Optional local console worker, polling and reminder offsets. See [notification setup](NOTIFICATION_SETUP.md). |
 | BRIEFING_TEST_EMAIL | Required to enqueue simulated briefing; no email sender |
 
 ## Boundaries and adapters

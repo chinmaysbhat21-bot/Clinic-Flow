@@ -10,6 +10,8 @@ import { configureOtpDelivery } from '../../apps/api/src/otp-delivery.js';
 import { Payments } from '../../apps/api/src/payments.js';
 import { Engine } from '../../apps/api/src/core.js';
 import { ReconciliationWorker } from '../../apps/api/src/reconciliation.js';
+import { configureNotificationDelivery,NotificationWorker,type NotificationProvider } from '../../apps/api/src/notification-worker.js';
+import { enqueuePaymentNotice } from '../../apps/api/src/notification-outbox.js';
 import { expireHolds,openDb,seed,transaction } from '../../apps/api/src/db.js';
 import { createApp } from '../../apps/api/src/server.js';
 import { signature } from '../../apps/api/src/core.js';
@@ -471,6 +473,131 @@ test('an inconclusive move remains quarantined after hold expiry and manual esca
   assert.equal(f.engine.booking('lotus',f.session,appointment.id).start,appointment.start);
   assert.equal(f.engine.one('SELECT replacement_id FROM booking_operations')?.replacement_id,replacement.id);
   await assert.rejects(f.engine.reserve('lotus',f.session,target),{code:'SLOT_UNAVAILABLE'});
+ }finally{await f.close();}
+});
+test('notification outbox is atomic, deduplicated and delivers only redacted development messages',async()=>{
+ const f=await fixture();
+ try{
+  const hold=await f.verifiedHold();
+  await f.request('/api/notification-preferences','POST',{enabled:true,language:'kn'},f.session);
+  const payment=await f.pay(hold.id);
+  f.db.exec("CREATE TRIGGER fixture_notify_rollback BEFORE INSERT ON notification_jobs BEGIN SELECT RAISE(ABORT,'fixture outbox failure'); END;");
+  assert.equal((await payment.verify()).status,500);
+  assert.equal(f.engine.one('SELECT state FROM payments WHERE hold_id=?',hold.id)?.state,'CREATED');
+  assert.equal(f.engine.one('SELECT COUNT(*) AS n FROM outbox')?.n,0);
+  f.db.exec('DROP TRIGGER fixture_notify_rollback;');
+  assert.equal((await payment.verify()).data.state,'PAYMENT_VERIFIED');
+  await payment.verify();
+  const booking=await f.engine.confirm('lotus',f.session,hold.id);
+  await f.engine.confirm('lotus',f.session,hold.id);
+  f.engine.briefing('lotus',f.session,booking.id,'Private fictional medical text','private-fixture@example.invalid');
+  assert.equal(f.engine.one("SELECT COUNT(*) AS n FROM notification_jobs WHERE event='CONFIRMATION'")?.n,1);
+  assert.equal(f.engine.one("SELECT COUNT(*) AS n FROM notification_jobs WHERE event='PAYMENT_CONFIRMED'")?.n,1);
+  const sent:string[]=[];
+  const consoleProvider=configureNotificationDelivery('development','development-console',line=>sent.push(line))!;
+  assert.throws(()=>configureNotificationDelivery('production','development-console'),/requires/);
+  const worker=new NotificationWorker(f.db,consoleProvider,{},f.engine.now);
+  while(await worker.runOnce()){}
+  assert.equal(sent.length,3);
+  assert.equal(f.engine.one("SELECT COUNT(*) AS n FROM notification_jobs WHERE status='SIMULATED'")?.n,3);
+  for(const excluded of [f.session,'Private fictional medical text','private-fixture@example.invalid','+919999999999',payment.body.razorpay_signature]){
+   assert.equal(sent.join('').includes(excluded),false);
+  }
+  for(const clinic of ['lotus','harbor']){
+   const login=await f.request('/api/admin/login','POST',{email:clinic+'@demo.invalid',password:'test-password-123'});
+   const list=await f.request('/api/admin/notifications','GET',undefined,undefined,clinic,login.data.token);
+   assert.equal(list.data.length,clinic==='lotus'?4:0);
+   if(clinic==='lotus')assert.deepEqual(Object.keys(list.data[0]).sort(),['id','event','channel','status','attempts','scheduledAt','nextAttemptAt','reason','bookingReference'].sort());
+  }
+ }finally{await f.close();}
+});
+
+test('reschedule replaces reminders, cancellation and stale or opted-out reminders are suppressed',async()=>{
+ const f=await fixture();
+ try{
+  const hold=await f.verifiedHold();
+  await f.request('/api/notification-preferences','POST',{enabled:true},f.session);
+  await (await f.pay(hold.id)).verify();
+  const a=await f.engine.confirm('lotus',f.session,hold.id);
+  const old=f.engine.all("SELECT * FROM notification_jobs WHERE event='REMINDER'");
+  assert.equal(old.length,1);
+  const target='2026-12-04T03:30:00.000Z';
+  const replacement=await f.engine.reserve('lotus',f.session,{...f.input,start:target});
+  await f.engine.reschedule('lotus',f.session,a.id,replacement.id);
+  const scheduled=f.engine.all("SELECT * FROM notification_jobs WHERE event='REMINDER' AND status='PENDING' ORDER BY scheduled_at");
+  assert.deepEqual(scheduled.map(j=>j.scheduled_at),[Date.parse(target)-86400000,Date.parse(target)-3600000]);
+  assert.equal(f.engine.one('SELECT status FROM notification_jobs WHERE id=?',old[0].id)?.status,'SUPPRESSED');
+  const lines:string[]=[];
+  const worker=new NotificationWorker(f.db,configureNotificationDelivery('development','development-console',s=>lines.push(s))!,{},f.engine.now);
+  f.engine.run('UPDATE sessions SET expires_at=? WHERE id=?',Date.parse(target)+86400000,f.session);
+  f.advance(scheduled[0].scheduled_at-f.engine.now()+900001);
+  while(await worker.runOnce()){}
+  assert.equal(f.engine.one('SELECT last_error FROM notification_jobs WHERE id=?',scheduled[0].id)?.last_error,'STALE_REMINDER');
+  await f.engine.cancel('lotus',f.session,a.id);
+  assert.equal((await f.request('/api/notification-preferences','POST',{enabled:false},f.session)).status,200);
+  while(await worker.runOnce()){}
+  assert.equal(f.engine.one('SELECT status FROM notification_jobs WHERE id=?',scheduled[1].id)?.status,'SUPPRESSED');
+  assert.equal(f.engine.one("SELECT last_error FROM notification_jobs WHERE event='CANCELLATION'")?.last_error,'CONSENT_OR_PREFERENCE_MISSING');
+  assert.equal(lines.some(s=>s.includes('"kind":"REMINDER"')),false);
+ }finally{await f.close();}
+});
+
+test('notification lease takeover fences stale workers across database connections',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'clinic-notification-'));
+ const path=join(dir,'clinic.db');
+ try{
+  const f=await fixture(path);
+  try{
+   const hold=await f.verifiedHold();
+   await f.request('/api/notification-preferences','POST',{enabled:true},f.session);
+   await (await f.pay(hold.id)).verify();
+   const started=signal(),release=signal();
+   const ids:string[]=[];
+   const provider:NotificationProvider={key:'idempotent-fixture',channels:['CONSOLE'],idempotent:true,async deliver(message){
+    ids.push(message.id);
+    if(ids.length===1){started.resolve();await release.promise;return 'PERMANENT';}
+    return 'DELIVERED';
+   }};
+   const first=new NotificationWorker(f.db,provider,{leaseMs:60000},f.engine.now);
+   const pending=first.runOnce();
+   await started.promise;
+   const reopened=openDb(path);
+   try{
+    const second=new NotificationWorker(reopened,provider,{leaseMs:60000},f.engine.now);
+    assert.equal(await second.runOnce(),false);
+    f.advance(60001);
+    assert.equal(await second.runOnce(),true);
+    assert.equal(ids.length,2);
+    assert.equal(ids[0],ids[1]);
+   }finally{reopened.close();release.resolve();await pending;}
+   assert.equal(f.engine.one('SELECT status FROM notification_jobs')?.status,'DELIVERED');
+  }finally{await f.close();}
+ }finally{rmSync(dir,{recursive:true});}
+});
+
+test('definitive failures retry and exhaust; ambiguous non-idempotent delivery needs manual review',async()=>{
+ const f=await fixture();
+ try{
+  const hold=await f.verifiedHold();
+  await f.request('/api/notification-preferences','POST',{enabled:true},f.session);
+  await (await f.pay(hold.id)).verify();
+  let attempts=0;
+  const provider:NotificationProvider={key:'fixture',channels:['CONSOLE'],idempotent:false,async deliver(){attempts++;return 'RETRY';}};
+  const worker=new NotificationWorker(f.db,provider,{maxAttempts:2,retryMs:100},f.engine.now);
+  assert.equal(await worker.runOnce(),true);
+  assert.equal(await worker.runOnce(),false);
+  f.advance(100);
+  assert.equal(await worker.runOnce(),true);
+  assert.equal(attempts,2);
+  assert.equal(f.engine.one('SELECT last_error FROM notification_jobs')?.last_error,'RETRY_LIMIT');
+  transaction(f.db,()=>{
+   f.engine.run("UPDATE payments SET state='REFUNDED' WHERE hold_id=?",hold.id);
+   enqueuePaymentNotice(f.db,hold.id,'REFUND_COMPLETED',f.engine.now());
+  });
+  const ambiguous=new NotificationWorker(f.db,{...provider,async deliver(){throw new Error('private provider payload');}},{},f.engine.now);
+  assert.equal(await ambiguous.runOnce(),true);
+  assert.equal(await ambiguous.runOnce(),false);
+  assert.equal(f.engine.one("SELECT last_error FROM notification_jobs WHERE event='REFUND_COMPLETED'")?.last_error,'AMBIGUOUS_DELIVERY');
  }finally{await f.close();}
 });
 test('Google adapter fails closed without credentials',async()=>{await assert.rejects(()=>new GoogleAdapter('','').getSlots({doctorId:'x',start:'2026-12-01T00:00:00Z',end:'2026-12-02T00:00:00Z'}),/Google Calendar credentials/);});
