@@ -6,6 +6,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { reconcileOffline } from '../../apps/api/src/recovery.js';
+import { configureBrevo } from '../../apps/api/src/brevo-notifications.js';
 import { configureOtpDelivery } from '../../apps/api/src/otp-delivery.js';
 import { Payments } from '../../apps/api/src/payments.js';
 import { Engine } from '../../apps/api/src/core.js';
@@ -879,3 +880,163 @@ test('authenticated administration supports clinic operations and evidence-only 
  }finally{await f.close();}
 });
 test('Google adapter fails closed without credentials',async()=>{await assert.rejects(()=>new GoogleAdapter('','').getSlots({doctorId:'x',start:'2026-12-01T00:00:00Z',end:'2026-12-02T00:00:00Z'}),/Google Calendar credentials/);});
+
+const brevoTestConfig = {
+ BREVO_API_KEY:'fixture-brevo-key',
+ BREVO_SENDER_EMAIL:'sender@example.invalid',
+ BREVO_TEST_CLINIC_ID:'lotus',
+ BREVO_TEST_RECIPIENT_EMAIL:'recipient@example.invalid',
+};
+const emailPreference = {enabled:true,channel:'EMAIL',email:'Recipient@example.invalid'};
+
+test('Brevo submission uses a durable quota across workers and restarts, and acceptance is not delivery',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'clinic-brevo-'));
+ const path=join(dir,'clinic.db');
+ const f=await fixture(path);
+ try{
+  const hold=await f.verifiedHold();
+  const preference=await f.request('/api/notification-preferences','POST',emailPreference,f.session);
+  assert.deepEqual(preference.data,{enabled:true,channel:'EMAIL',language:'en'});
+  const payment=await f.pay(hold.id);
+  await payment.verify();
+  await payment.verify();
+  const booking=await f.engine.confirm('lotus',f.session,hold.id);
+  await f.engine.confirm('lotus',f.session,hold.id);
+  assert.equal(f.engine.one("SELECT COUNT(*) AS n FROM notification_jobs WHERE event IN ('CONFIRMATION','PAYMENT_CONFIRMED')")?.n,2);
+
+  const started=signal(),release=signal(),logs:string[]=[];
+  let calls=0;
+  const provider=configureBrevo('development',{...brevoTestConfig,BREVO_DAILY_LIMIT:'1'},async(url,init)=>{
+   calls++;
+   assert.equal(url,'https://api.brevo.com/v3/smtp/email');
+   assert.equal(new Headers(init?.headers).get('api-key'),brevoTestConfig.BREVO_API_KEY);
+   const body=JSON.parse(String(init?.body));
+   assert.deepEqual(body.to,[{email:brevoTestConfig.BREVO_TEST_RECIPIENT_EMAIL}]);
+   assert.deepEqual(Object.keys(body).sort(),['sender','subject','textContent','to']);
+   assert.equal(body.textContent.includes(f.session),false);
+   started.resolve();
+   await release.promise;
+   return Response.json({messageId:'private-provider-id'},{status:201});
+  });
+  const pending=new NotificationWorker(f.db,provider,{},f.engine.now,line=>logs.push(line)).runOnce();
+  try{
+   await Promise.race([started.promise,pending.then(()=>assert.fail('Provider was not called'))]);
+   const other=openDb(path);
+   try{
+    assert.equal(await new NotificationWorker(other,provider,{},f.engine.now).runOnce(),true);
+    assert.equal(calls,1);
+    assert.equal(other.prepare("SELECT attempts FROM notification_jobs WHERE last_error='EMAIL_DAILY_LIMIT'").get()?.attempts,0);
+   }finally{other.close();}
+  }finally{release.resolve();await pending;}
+  assert.equal(f.engine.booking('lotus',f.session,booking.id).state,'CONFIRMED');
+
+  const reopened=openDb(path);
+  try{
+   const worker=new NotificationWorker(reopened,provider,{},f.engine.now);
+   assert.equal(await worker.runOnce(),false);
+   assert.equal(reopened.prepare('SELECT COUNT(*) AS n FROM email_submission_budget').get()?.n,1);
+   f.advance(86400000);
+   while(await worker.runOnce()){}
+   assert.equal(calls,2);
+   assert.equal(reopened.prepare("SELECT COUNT(*) AS n FROM notification_jobs WHERE status='ACCEPTED'").get()?.n,2);
+  }finally{reopened.close();}
+  const login=await f.request('/api/admin/login','POST',{email:'lotus@demo.invalid',password:'test-password-123'});
+  const list=await f.request('/api/admin/notifications','GET',undefined,undefined,'lotus',login.data.token);
+  assert.equal(list.data.filter((row:{status:string})=>row.status==='ACCEPTED').length,2);
+  assert.equal(list.data.some((row:{status:string})=>row.status==='DELIVERED'),false);
+  const exposed=JSON.stringify({logs,list,preference});
+  for(const value of [brevoTestConfig.BREVO_API_KEY,brevoTestConfig.BREVO_TEST_RECIPIENT_EMAIL,'private-provider-id',f.session]){
+   assert.equal(exposed.includes(value),false);
+  }
+ }finally{await f.close();rmSync(dir,{recursive:true});}
+});
+
+test('Brevo rejects unsafe configuration and classifies failures without replaying uncertain submissions',async(t)=>{
+ assert.throws(()=>configureBrevo('production',brevoTestConfig),/Brevo demo requires/);
+ assert.throws(()=>configureBrevo('development',{...brevoTestConfig,BREVO_DAILY_LIMIT:'300'}),/Brevo demo requires/);
+ const cases=[
+  {name:'rejected payload',http:400,reason:'PROVIDER_REJECTED',status:'MANUAL'},
+  {name:'invalid key',http:401,reason:'PROVIDER_REJECTED',status:'MANUAL'},
+  {name:'rate limited',http:429,reason:'PROVIDER_RETRY',status:'PENDING'},
+  {name:'gateway failure',http:502,reason:'AMBIGUOUS_DELIVERY',status:'MANUAL'},
+  {name:'unverifiable success',http:201,reason:'AMBIGUOUS_DELIVERY',status:'MANUAL'},
+  {name:'timeout',http:0,reason:'AMBIGUOUS_DELIVERY',status:'MANUAL'},
+ ];
+ for(const item of cases)await t.test(item.name,async()=>{
+  const f=await fixture();
+  try{
+   const hold=await f.verifiedHold();
+   await f.request('/api/notification-preferences','POST',emailPreference,f.session);
+   await (await f.pay(hold.id)).verify();
+   let calls=0;
+   const provider=configureBrevo('development',brevoTestConfig,async(_url,init)=>{
+    calls++;
+    if(item.http)return Response.json({error:'sensitive provider response'},{status:item.http});
+    return new Promise<Response>((_resolve,reject)=>init?.signal?.addEventListener('abort',()=>reject(new Error('sensitive timeout')), {once:true}));
+   });
+   const worker=new NotificationWorker(f.db,provider,{retryMs:10,leaseMs:30},f.engine.now);
+   assert.equal(await worker.runOnce(),true);
+   const job=f.engine.one('SELECT status,last_error FROM notification_jobs');
+   assert.equal(job?.status,item.status);
+   assert.equal(job?.last_error,item.reason);
+   f.advance(10);
+   const retries=item.http===429;
+   assert.equal(await worker.runOnce(),retries);
+   assert.equal(calls,retries?2:1);
+   assert.equal(f.engine.one('SELECT COUNT(*) AS n FROM email_submission_budget')?.n,calls);
+  }finally{await f.close();}
+ });
+});
+
+test('Brevo suppresses withdrawn and unapproved email preferences before reserving quota',async()=>{
+ const f=await fixture();
+ try{
+  const hold=await f.verifiedHold();
+  await f.request('/api/notification-preferences','POST',emailPreference,f.session);
+  await (await f.pay(hold.id)).verify();
+  const booking=await f.engine.confirm('lotus',f.session,hold.id);
+  await f.request('/api/notification-preferences','POST',{...emailPreference,email:'other@example.invalid'},f.session);
+  let calls=0;
+  const provider=configureBrevo('development',brevoTestConfig,async()=>{calls++;return Response.json({messageId:'id'},{status:201});});
+  const worker=new NotificationWorker(f.db,provider,{},f.engine.now);
+  await worker.runOnce();
+  assert.equal(f.engine.one("SELECT COUNT(*) AS n FROM notification_jobs WHERE last_error='EMAIL_DESTINATION_NOT_APPROVED'")?.n,1);
+  await f.request('/api/notification-preferences','POST',{enabled:false},f.session);
+  while(await worker.runOnce()){}
+  assert.equal(f.engine.one("SELECT COUNT(*) AS n FROM notification_jobs WHERE last_error='CONSENT_OR_PREFERENCE_MISSING'")?.n,1);
+  assert.equal(f.engine.one('SELECT COUNT(*) AS n FROM email_submission_budget')?.n,0);
+  assert.equal(calls,0);
+  assert.equal(f.engine.booking('lotus',f.session,booking.id).state,'CONFIRMED');
+ }finally{await f.close();}
+});
+
+test('Brevo migration preserves existing preferences and restricts dispatch to the configured clinic',async()=>{
+ const dir=mkdtempSync(join(tmpdir(),'clinic-brevo-migration-'));
+ const path=join(dir,'clinic.db');
+ try{
+  const f=await fixture(path);
+  try{
+   const hold=await f.verifiedHold();
+   await f.request('/api/notification-preferences','POST',{enabled:true},f.session);
+   await (await f.pay(hold.id)).verify();
+   f.db.exec('ALTER TABLE notification_preferences DROP COLUMN email_destination_hash; DROP TABLE email_submission_budget;');
+  }finally{await f.close();}
+
+  const migrated=await fixture(path);
+  try{
+   const prior=migrated.db.prepare("SELECT * FROM notification_preferences WHERE channel='CONSOLE'").get();
+   assert.equal(prior?.enabled,1);
+   assert.equal(prior?.email_destination_hash,null);
+   const optIn=await migrated.request('/api/notification-preferences','POST',emailPreference,String(prior?.session_id));
+   assert.equal(optIn.status,200);
+   let calls=0;
+   const provider=configureBrevo('development',{...brevoTestConfig,BREVO_TEST_CLINIC_ID:'harbor'},async()=>{
+    calls++;
+    return Response.json({messageId:'id'},{status:201});
+   });
+   assert.equal(await new NotificationWorker(migrated.db,provider,{},migrated.engine.now).runOnce(),true);
+   assert.equal(migrated.engine.one('SELECT last_error FROM notification_jobs')?.last_error,'EMAIL_DESTINATION_NOT_APPROVED');
+   assert.equal(calls,0);
+  }finally{await migrated.close();}
+ }finally{rmSync(dir,{recursive:true});}
+});

@@ -68,6 +68,8 @@ export function openDb(path:string){
   lease_token TEXT, lease_until INTEGER, provider_key TEXT, last_error TEXT
  );
  CREATE INDEX IF NOT EXISTS notification_due ON notification_jobs(status,next_at,lease_until);
+ CREATE TABLE IF NOT EXISTS email_submission_budget(id INTEGER PRIMARY KEY, reserved_at INTEGER NOT NULL);
+ CREATE INDEX IF NOT EXISTS email_submission_budget_time ON email_submission_budget(reserved_at);
  CREATE TABLE IF NOT EXISTS briefings(appointment_id TEXT PRIMARY KEY,clinic_id TEXT NOT NULL,summary TEXT NOT NULL,created_at INTEGER NOT NULL);
  CREATE TABLE IF NOT EXISTS audit(id TEXT PRIMARY KEY,clinic_id TEXT NOT NULL,action TEXT NOT NULL,entity_id TEXT NOT NULL,created_at INTEGER NOT NULL);
  CREATE TABLE IF NOT EXISTS audit_details(audit_id TEXT PRIMARY KEY REFERENCES audit(id),actor_id TEXT,metadata TEXT);
@@ -78,6 +80,7 @@ export function openDb(path:string){
  WHERE a.state='CONFIRMATION_PENDING';
  `);
  transaction(db,()=>{
+ ensureColumn(db,'notification_preferences','email_destination_hash','TEXT');
  ensureColumn(db,'admins','role',"TEXT NOT NULL DEFAULT 'OWNER'");
  ensureColumn(db,'admin_sessions','admin_id','TEXT REFERENCES admins(id)');
  ensureColumn(db,'doctors','specialization',"TEXT NOT NULL DEFAULT ''");

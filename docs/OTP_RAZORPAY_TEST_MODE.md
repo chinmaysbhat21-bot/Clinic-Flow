@@ -1,5 +1,7 @@
 # Local OTP and Razorpay Test Mode
 
+Development OTP delivery is simulated and costs ₹0. The API writes the code to its private local terminal without sending an SMS. A successful demo verification establishes access to the development code only. Use fictional patient details, keep the terminal private, and enter the code directly in the patient UI so it stays out of AI prompts and transcripts.
+
 ## Chinmay and Jay
 
 1. Copy `.env.example` to `.env` at the repository root. Set a local `ADMIN_PASSWORD`, then set `NODE_ENV=development` and `OTP_MODE=development-console`. Run `npm.cmd ci` and `npm.cmd run dev`. Keep the terminal private and use fictional patient details. For production use `OTP_MODE=disabled` (or omit it). A development mode configured outside development fails at startup. There is no SMS provider configured.

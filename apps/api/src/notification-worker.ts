@@ -3,11 +3,12 @@ import { type DB,transaction } from './db.js';
 import type { Channel,NotificationEvent } from './notification-outbox.js';
 
 export type NotificationMessage={id:string;clinicId:string;channel:Channel;language:string;audience:'PATIENT'|'CLINIC';event:NotificationEvent;text:string};
-export type DeliveryResult='SIMULATED'|'DELIVERED'|'RETRY'|'AMBIGUOUS'|'PERMANENT';
+export type DeliveryResult='SIMULATED'|'ACCEPTED'|'DELIVERED'|'RETRY'|'AMBIGUOUS'|'PERMANENT';
 export interface NotificationProvider {
  readonly key:string;
  readonly channels:readonly Channel[];
  readonly idempotent:boolean;
+ readonly emailPolicy?:{clinicId:string;destinationHash:string;dailyLimit:number};
  deliver(message:NotificationMessage,signal:AbortSignal):Promise<DeliveryResult>;
 }
 
@@ -15,9 +16,9 @@ export function configureNotificationDelivery(environment:string|undefined,mode:
  if(!mode||mode==='disabled')return undefined;
  if(mode!=='development-console'||environment!=='development')throw new Error('Console notification delivery requires NODE_ENV=development');
  return {
-  key:'development-console',channels:['CONSOLE'],idempotent:false,
+  key:'development-console',channels:['CONSOLE','SMS','WHATSAPP'],idempotent:false,
   async deliver(message){
-   write(JSON.stringify({event:'notification_simulated',id:message.id,kind:message.event,text:message.text}));
+   write(JSON.stringify({event:'notification_simulated',id:message.id,kind:message.event,channel:message.channel,text:message.text}));
    return 'SIMULATED';
   },
  };
@@ -69,7 +70,7 @@ export class NotificationWorker {
  private claim():Job|'SKIPPED'|undefined{
   const db=this.db,now=this.now();
   return transaction(db,()=>{
-   const candidate=db.prepare(`SELECT j.*,o.clinic_id,p.enabled,p.channel AS preferred_channel,p.language,
+   const candidate=db.prepare(`SELECT j.*,o.clinic_id,p.enabled,p.channel AS preferred_channel,p.language,p.email_destination_hash,
      json_extract(c.config,'$.timezone') AS timezone,
      a.state AS booking_state,a.start AS booking_start,pay.state AS payment_state,
      (SELECT booking FROM consents WHERE clinic_id=o.clinic_id AND session_id=h.session_id ORDER BY created_at DESC,rowid DESC LIMIT 1) AS consent,
@@ -109,6 +110,21 @@ export class NotificationWorker {
     return skip('MANUAL','CHANNEL_UNAVAILABLE');
    }
    if(Number(candidate.attempts)>=this.options.maxAttempts)return skip('MANUAL','RETRY_LIMIT');
+   if(channel==='EMAIL'){
+    const policy=this.provider.emailPolicy;
+    if(!policy||candidate.clinic_id!==policy.clinicId||candidate.email_destination_hash!==policy.destinationHash){
+     return skip('SUPPRESSED','EMAIL_DESTINATION_NOT_APPROVED');
+    }
+    const windowMs=86400000;
+    db.prepare('DELETE FROM email_submission_budget WHERE reserved_at<=?').run(now-windowMs);
+    const budget=db.prepare('SELECT COUNT(*) AS used, MIN(reserved_at) AS oldest FROM email_submission_budget').get()!;
+    if(Number(budget.used)>=policy.dailyLimit){
+     db.prepare("UPDATE notification_jobs SET channel=?,next_at=?,last_error='EMAIL_DAILY_LIMIT' WHERE id=?")
+      .run(channel,Number(budget.oldest)+windowMs,id);
+     return 'SKIPPED';
+    }
+    db.prepare('INSERT INTO email_submission_budget(reserved_at) VALUES(?)').run(now);
+   }
    return db.prepare(`UPDATE notification_jobs SET status='RUNNING',attempts=attempts+1,channel=?,lease_token=?,lease_until=?,provider_key=?
      WHERE id=? RETURNING *,? AS clinic_id,? AS language,? AS timezone`)
     .get(channel,randomUUID(),now+this.options.leaseMs,this.provider.key,id,candidate.clinic_id,candidate.language,candidate.timezone) as Job|undefined;
@@ -140,7 +156,7 @@ export class NotificationWorker {
   finally{clearTimeout(timeout);}
   const retryable=result==='RETRY'||(result==='AMBIGUOUS'&&this.provider.idempotent);
   const retry=retryable&&job.attempts<this.options.maxAttempts;
-  const status=retry?'PENDING':result==='DELIVERED'||result==='SIMULATED'?result:'MANUAL';
+  const status=retry?'PENDING':result==='DELIVERED'||result==='SIMULATED'||result==='ACCEPTED'?result:'MANUAL';
   const reason=result==='AMBIGUOUS'?'AMBIGUOUS_DELIVERY':retry?'PROVIDER_RETRY':retryable?'RETRY_LIMIT':result==='PERMANENT'?'PROVIDER_REJECTED':null;
   const now=this.now(),delay=Math.min(3600000,this.options.retryMs*2**Math.min(job.attempts-1,16));
   const changed=this.db.prepare(`UPDATE notification_jobs SET status=?,last_error=?,next_at=?,lease_token=NULL,lease_until=NULL

@@ -1,4 +1,5 @@
 import express,{type Request,type Response,type NextFunction} from 'express';
+import { emailDestinationHash, notificationEmail } from './brevo-notifications.js';
 import { channels } from './notification-outbox.js';
 import { RefundWorker } from './refund-worker.js';
 import { buildAdminSummary,findBlockWarnings,findConfigWarnings,findDeactivationWarnings,findDoctorScheduleWarnings,isValidTimeZone,LoginLimiter,resolveReconciliation } from './admin.js';
@@ -313,10 +314,12 @@ export function createApp(db:DB,options:{mockBase?:string;mockKey:string;webhook
  app.use('/api',(req,res,next)=>{const clinic=String(req.headers['x-clinic-id']??''),session=String(req.headers['x-session-id']??'');const s=engine.one('SELECT * FROM sessions WHERE id=? AND clinic_id=? AND expires_at>?',session,clinic,engine.now());if(!s)return next(new Fault('SESSION_REQUIRED','Valid clinic session headers required',401));res.locals.clinic=clinic;res.locals.session=session;next();});
  app.post('/api/consent',(req,res)=>{const p=contracts.consentRequest.parse(req.body);engine.run('INSERT INTO consents VALUES(?,?,?,?,?,?)',randomUUID(),res.locals.session,res.locals.clinic,1,Number(p.briefing),engine.now());ok(res,{recorded:true});});
  app.post('/api/notification-preferences',(req,res)=>{
-  const p=z.object({enabled:z.boolean(),channel:z.enum(channels).default('CONSOLE'),language:contracts.language.default('en')}).strict().parse(req.body);
-  engine.run(`INSERT INTO notification_preferences VALUES(?,?,?,?,?)
-   ON CONFLICT(session_id) DO UPDATE SET enabled=excluded.enabled,channel=excluded.channel,language=excluded.language
-   WHERE notification_preferences.clinic_id=excluded.clinic_id`,res.locals.session,res.locals.clinic,Number(p.enabled),p.channel,p.language);
+  const {email,...p}=z.object({enabled:z.boolean(),channel:z.enum(channels).default('CONSOLE'),
+   language:contracts.language.default('en'),email:notificationEmail.optional()}).strict().parse(req.body);
+  const destination=p.enabled&&p.channel==='EMAIL'&&email?emailDestinationHash(email):null;
+  engine.run(`INSERT INTO notification_preferences(session_id,clinic_id,enabled,channel,language,email_destination_hash) VALUES(?,?,?,?,?,?)
+   ON CONFLICT(session_id) DO UPDATE SET enabled=excluded.enabled,channel=excluded.channel,language=excluded.language,email_destination_hash=excluded.email_destination_hash
+   WHERE notification_preferences.clinic_id=excluded.clinic_id`,res.locals.session,res.locals.clinic,Number(p.enabled),p.channel,p.language,destination);
   ok(res,p);
  });
  app.get('/api/slots',async(req,res)=>{const p=contracts.slotQuery.parse(req.query);ok(res,await engine.available(res.locals.clinic,p.doctorId,p.serviceId,p.date));});
