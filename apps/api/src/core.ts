@@ -1,6 +1,7 @@
 import { randomUUID,randomInt,scryptSync,timingSafeEqual,createHmac } from 'node:crypto';
 import { expireHolds,transaction,type DB } from './db.js';
 import type { BookingAdapter,Slot } from '../../../packages/shared/src/index.js';
+import { clinicDate,clinicHour } from './clinic-time.js';
 export class Fault extends Error {constructor(public code:string,message:string,public status=400){super(message);}}
 export function requireThat(ok:unknown,code:string,message=code,status=400):asserts ok {if(!ok)throw new Fault(code,message,status);}
 export function equal(a:string,b:string){const aa=Buffer.from(a),bb=Buffer.from(b);return aa.length===bb.length&&timingSafeEqual(aa,bb);}
@@ -18,23 +19,26 @@ export class Engine {
  slots(clinic:string,doctorId:string,serviceId:string,date:string):Slot[]{
  const c=this.clinic(clinic);const d=this.one('SELECT * FROM doctors WHERE id=? AND clinic_id=? AND active=1',doctorId,clinic);const s=this.one('SELECT * FROM services WHERE id=? AND clinic_id=? AND active=1',serviceId,clinic);
  requireThat(d&&s&&this.one('SELECT 1 FROM doctor_services WHERE doctor_id=? AND service_id=?',doctorId,serviceId),'INVALID_SELECTION');
- const schedule=JSON.parse(d.schedule);const day=new Date(`${date}T12:00:00+05:30`).getUTCDay();if(!schedule.days.includes(day))return [];
+ const schedule=JSON.parse(d.schedule);const day=new Date(`${date}T00:00:00Z`).getUTCDay();if(!schedule.days.includes(day))return [];
  const startHour=Math.max(schedule.start,c.config.operatingHours.start),endHour=Math.min(schedule.end,c.config.operatingHours.end);
- const base=Date.parse(`${date}T00:00:00+05:30`);const slots:Slot[]=[];
- for(let t=base+startHour*3600000;t+s.duration*60000<=base+endHour*3600000;t+=s.duration*60000){
+ const startTime=clinicHour(date,startHour,c.config.timezone);
+ const endTime=clinicHour(date,endHour,c.config.timezone);
+ if(startTime===undefined||endTime===undefined)return [];
+ const slots:Slot[]=[];
+ for(let t=startTime;t+s.duration*60000<=endTime;t+=s.duration*60000){
  const start=new Date(t).toISOString(),end=new Date(t+s.duration*60000).toISOString();
  if(t<=this.now())continue;
  if(this.one('SELECT 1 FROM blocks WHERE clinic_id=? AND (doctor_id IS NULL OR doctor_id=?) AND start<? AND end>?',clinic,doctorId,end,start))continue;
- if(this.one("SELECT 1 FROM appointments WHERE doctor_id=? AND state IN ('CONFIRMED','CONFIRMATION_PENDING') AND start<? AND end>?",doctorId,end,start))continue;
- if(this.one(`SELECT 1 FROM holds h WHERE doctor_id=? AND start<? AND end>?
+ if(this.one("SELECT 1 FROM appointments WHERE (doctor_id=? OR (?='google' AND clinic_id=?)) AND state IN ('CONFIRMED','CONFIRMATION_PENDING') AND start<? AND end>?",doctorId,c.adapter,clinic,end,start))continue;
+ if(this.one(`SELECT 1 FROM holds h WHERE (doctor_id=? OR (?='google' AND clinic_id=?)) AND start<? AND end>?
   AND ((state NOT IN ('CANCELLED','EXPIRED','CONFIRMED') AND expires_at>?)
-    OR EXISTS (SELECT 1 FROM booking_operations WHERE replacement_id=h.id))`,doctorId,end,start,this.now()))continue;
+    OR EXISTS (SELECT 1 FROM booking_operations WHERE replacement_id=h.id))`,doctorId,c.adapter,clinic,end,start,this.now()))continue;
  slots.push({start,end});}return slots;
  }
  async available(clinic:string,doctor:string,service:string,date:string){const local=this.slots(clinic,doctor,service,date);if(!local.length)return [];
  const busy=await this.adapters(clinic).getSlots({doctorId:doctor,start:local[0].start,end:local.at(-1)!.end});return local.filter(s=>!busy.some(b=>b.start<s.end&&b.end>s.start));}
  async reserve(clinic:string,session:string,input:{doctorId:string;serviceId:string;start:string}):Promise<Row>{
- this.consent(clinic,session);const date=new Date(Date.parse(input.start)+19800000).toISOString().slice(0,10);const start=new Date(input.start).toISOString();
+ this.consent(clinic,session);const date=clinicDate(Date.parse(input.start),this.clinic(clinic).config.timezone);const start=new Date(input.start).toISOString();
  const candidate=(await this.available(clinic,input.doctorId,input.serviceId,date)).find(s=>s.start===start);requireThat(candidate,'SLOT_UNAVAILABLE',undefined,409);
  const h=transaction(this.db,()=>{requireThat(this.slots(clinic,input.doctorId,input.serviceId,date).some(s=>s.start===start),'SLOT_UNAVAILABLE',undefined,409);const s=this.one('SELECT fee FROM services WHERE id=?',input.serviceId)!;const id=randomUUID(),expires=this.now()+this.clinic(clinic).config.holdSeconds*1000;
  this.run('INSERT INTO holds(id,clinic_id,session_id,doctor_id,service_id,start,end,fee,expires_at,state) VALUES(?,?,?,?,?,?,?,?,?,?)',id,clinic,session,input.doctorId,input.serviceId,start,candidate.end,s.fee,expires,'HELD');return this.hold(clinic,session,id);});

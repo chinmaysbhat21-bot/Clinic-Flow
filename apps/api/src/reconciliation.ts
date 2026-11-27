@@ -117,12 +117,12 @@ export class ReconciliationWorker {
   const adapter=e.adapters(job.clinic_id);
   if(!adapter.lookupBooking)return 'MANUAL';
   // Only positive evidence can complete an operation. A missing or unchanged record may mean the write is still in flight.
-  const externalId=kind==='CONFIRM'?ref:appointment.external_id;
+  const externalId=kind==='CONFIRM'?(adapter.confirmationLookupId?.(ref)??ref):appointment.external_id;
   if(!externalId)return 'MANUAL';
   const remote=await adapter.lookupBooking(externalId);
   if(!remote)return 'RETRY';
   const expected=replacement??appointment;
-  if(remote.id!==externalId||remote.doctorId!==expected.doctor_id)return 'MANUAL';
+  if(remote.id!==externalId||(kind!=='CANCEL'&&remote.doctorId!==expected.doctor_id))return 'MANUAL';
   const applied=kind==='CANCEL'?remote.state==='CANCELLED':
    remote.state==='CONFIRMED'&&remote.start===expected.start&&remote.end===expected.end;
   if(!applied)return 'RETRY';

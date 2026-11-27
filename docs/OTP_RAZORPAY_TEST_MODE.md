@@ -24,3 +24,5 @@ The reconciliation worker looks for authoritative order and booking evidence. Am
 ## Verified Test Mode checkout
 
 On 2026-11-27 the Lotus test checkout produced a captured INR 500.00 payment and a paid order. The backend verified the capture, confirmed one appointment, and returned it once through the clinic admin API. Replayed verification returned VERIFIED and repeated confirmation returned the same booking. The archived SQLite records contain one matching order, hold and confirmed appointment. A separate provider API lookup confirmed one captured payment on that order. External webhook delivery remains unverified; the integration suite exercises signed deliveries locally.
+
+For a future external webhook smoke test, obtain approval for an HTTPS ingress that forwards only `POST /api/payments/webhook` with the original bytes and Razorpay signature headers. Reject every other path and method at the ingress, keep the API listener on loopback, and apply a request size limit. Keep development OTP output and admin routes local. Use a distinct Test Mode webhook secret, verify delivery in the Razorpay dashboard, and remove the ingress when finished.

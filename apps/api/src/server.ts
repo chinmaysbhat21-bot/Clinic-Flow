@@ -4,11 +4,15 @@ import { z } from 'zod';
 import * as contracts from '../../../packages/shared/src/index.js';
 import { Engine,Fault,requireThat,equal,signature } from './core.js';
 import { type DB,transaction } from './db.js';
-import { GoogleAdapter,MockAdapter } from './adapters.js';
+import { GoogleAdapter,MockAdapter,googleCalendarId } from './adapters.js';
 import { Payments,RazorpayProvider,type PaymentProvider } from './payments.js';
 export function createApp(db:DB,options:{mockBase?:string;mockKey:string;webhookSecret?:string;otpSink?:(id:string,code:string,phone:string)=>void;provider?:PaymentProvider;now?:()=>number;origins?:string[]} ){
  const app=express();app.disable('x-powered-by');
- const engine:Engine=new Engine(db,clinic=>engine.clinic(clinic).adapter==='google'?new GoogleAdapter(process.env.GOOGLE_ACCESS_TOKEN??'',process.env.GOOGLE_CALENDAR_ID??''):new MockAdapter(options.mockBase??'http://127.0.0.1:4000/mock',clinic,options.mockKey),options.otpSink,options.now);
+ const engine:Engine=new Engine(db,clinic=>{
+  const {adapter,config}=engine.clinic(clinic);
+  if(adapter==='google')return new GoogleAdapter(process.env.GOOGLE_ACCESS_TOKEN??'',googleCalendarId(clinic,process.env.GOOGLE_CALENDARS_JSON,process.env.GOOGLE_CALENDAR_ID),config.timezone);
+  return new MockAdapter(options.mockBase??'http://127.0.0.1:4000/mock',clinic,options.mockKey);
+ },options.otpSink,options.now);
  const provider=options.provider??new RazorpayProvider(process.env.RAZORPAY_KEY_ID??'',process.env.RAZORPAY_KEY_SECRET??'');
  const payments=new Payments(engine,provider);
  const hash=(s:string)=>createHash('sha256').update(s).digest('hex');
