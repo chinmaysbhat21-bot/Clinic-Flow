@@ -26,17 +26,29 @@ The additive migration creates `notification_preferences` and `notification_jobs
 
 Supported events include confirmation, cancellation, reschedule, reminders, verified payment, refund pending, refund manual review, and consented clinic briefing notices. Refund completed is queued only when the refund worker verifies the provider outcome and sets the payment to REFUNDED. Briefing notices are generic and console-only. The worker does not send the patient-reported briefing text.
 
-The worker rechecks current booking/payment state, the latest recorded consent and the session's selected channel immediately before dispatch. Preferences persist with the original booking session so a valid opt-in can outlast the browser session. The current self-service preference endpoint still requires an active session. After expiry, ask clinic staff for help with the booking. Brevo handles only the EMAIL channel. SMS and WhatsApp remain simulated. Language codes en, kn and hi are preserved for future localized templates; the initial templates use English.
+The worker rechecks current booking/payment state, the latest recorded consent and the session's selected channel immediately before dispatch. Preferences persist with the original booking session so a valid opt-in can outlast the browser session. The current self-service preference endpoint still requires an active session. After expiry, ask clinic staff for help with the booking. Brevo handles only the EMAIL channel. SMS and WhatsApp remain simulated. The worker renders English (`en`), Kannada (`kn`) or Hindi (`hi`) using the saved preference at dispatch. Omitted preferences use English by default and an unsupported stored language falls back to English.
 
 Reminder offsets are elapsed time before a UTC appointment instant. The worker formats the message in the clinic time zone. A move invalidates old reminders and schedules new ones. A cancellation suppresses outstanding reminders. Reminders more than 15 minutes late, after the appointment, or whose booking is pending or changed are suppressed. An external provider call already in flight cannot always be withdrawn if a patient revokes consent or the booking changes.
 
 The worker claims one due job with a 60-second lease and uses a stable notification ID as the provider idempotency key. A definite retryable failure starts at 15 seconds and doubles to a one-hour cap. The limit is eight attempts. A lost response or expired lease can be replayed only for the same provider and channel when that provider guarantees idempotency. Otherwise it moves to MANUAL. Stop the worker before manually requeuing an investigated job. Requeue only after proving non-delivery or obtaining an idempotent provider replay guarantee. Job metadata contains no raw provider errors or email addresses. The preference record stores a normalized destination hash to bind the opt-in to the configured inbox. Browser opt-out clears that hash.
 
+## Template maintenance and samples
+
+Keep the static subjects, bodies and field labels in `apps/api/src/notification-templates.ts`. Add every event to all three languages and review terminology with fluent Kannada and Hindi speakers. Appointment times use the selected language and the clinic time zone. Verified INR amounts use Indian digit grouping. Include amounts only for verified payments and completed refunds with recorded amounts. Pending refund notices give no credit date. A missing template or invalid date/time zone puts the notification into manual review with `RENDER_FAILED`, before reserving email quota or contacting the provider.
+
+Email messages preserve clinic names, doctor names and booking references as stored when the details are available. Simulated console messages omit these booking details and amounts. Staff briefing notices stay generic and console-only. The examples below use the fictional clinic Harbor Clinic Test, doctor Demo Doctor, and reference DEMO-EMAIL-001. Those values are preserved in every email.
+
+| Language | Subject | Body excerpt |
+|---|---|---|
+| English | Appointment confirmed | Your appointment is confirmed. Appointment time: 1 Dec 2026, 9:00 am (Asia/Kolkata). |
+| Kannada | ಅಪಾಯಿಂಟ್‌ಮೆಂಟ್ ದೃಢೀಕರಣ | ನಿಮ್ಮ ಅಪಾಯಿಂಟ್‌ಮೆಂಟ್ ದೃಢಪಟ್ಟಿದೆ. ಅಪಾಯಿಂಟ್‌ಮೆಂಟ್ ಸಮಯ: ಡಿಸೆಂ 1, 2026, 09:00 AM (Asia/Kolkata). |
+| Hindi | अपॉइंटमेंट की पुष्टि | आपके अपॉइंटमेंट की पुष्टि हो गई है। अपॉइंटमेंट का समय: 1 दिस॰ 2026, 9:00 am (Asia/Kolkata). |
+
 ## Jay and Nandan
 
-Jay can offer an explicit opt-in in the existing booking experience. Use the normal patient session headers for preferences. Render the clinic-scoped `GET /api/admin/notifications` list with event, status, attempt count, reason, next attempt and optional booking reference. Show SIMULATED and ACCEPTED distinctly. ACCEPTED means provider acceptance. Treat inbox delivery as unverified. Keep existing booking pending and confirmation screens based on booking state.
+Jay can offer an explicit opt-in in the existing booking experience. Use the normal patient session headers and existing `language` field for preferences. Keep text wrapping and Unicode rendering available to all patients. Render the clinic-scoped `GET /api/admin/notifications` list with event, status, attempt count, reason, next attempt and optional booking reference. Show SIMULATED and ACCEPTED distinctly. ACCEPTED means provider acceptance. Treat inbox delivery as unverified. Keep existing booking pending and confirmation screens based on booking state.
 
-Nandan can collect a communication preference through the widget, keep consent separate from booking success, and pass the supported language code. Never invent notification delivery or include OTPs, provider payloads, or medical details in a notification request.
+Nandan can collect a communication preference through the widget, keep consent separate from booking success, and pass the supported language code matching the patient’s chosen conversation language. Never invent notification delivery or include OTPs, provider payloads, or medical details in a notification request.
 
 ## Phase 8E live verification
 

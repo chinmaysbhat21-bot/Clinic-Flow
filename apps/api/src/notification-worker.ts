@@ -1,8 +1,9 @@
 import { randomUUID } from 'node:crypto';
 import { type DB,transaction } from './db.js';
+import { renderNotification } from './notification-templates.js';
 import type { Channel,NotificationEvent } from './notification-outbox.js';
 
-export type NotificationMessage={id:string;clinicId:string;channel:Channel;language:string;audience:'PATIENT'|'CLINIC';event:NotificationEvent;text:string};
+export type NotificationMessage={id:string;clinicId:string;channel:Channel;language:string;audience:'PATIENT'|'CLINIC';event:NotificationEvent;subject:string;text:string};
 export type DeliveryResult='SIMULATED'|'ACCEPTED'|'DELIVERED'|'RETRY'|'AMBIGUOUS'|'PERMANENT';
 export interface NotificationProvider {
  readonly key:string;
@@ -18,26 +19,15 @@ export function configureNotificationDelivery(environment:string|undefined,mode:
  return {
   key:'development-console',channels:['CONSOLE','SMS','WHATSAPP'],idempotent:false,
   async deliver(message){
-   write(JSON.stringify({event:'notification_simulated',id:message.id,kind:message.event,channel:message.channel,text:message.text}));
+   write(JSON.stringify({event:'notification_simulated',id:message.id,kind:message.event,channel:message.channel,language:message.language,subject:message.subject,text:message.text}));
    return 'SIMULATED';
   },
  };
 }
 
-const templates:Record<NotificationEvent,string>={
- CONFIRMATION:'Your appointment is confirmed.',
- CANCELLATION:'Your appointment was cancelled.',
- RESCHEDULE:'Your appointment has moved.',
- REMINDER:'Your appointment is coming up.',
- PAYMENT_CONFIRMED:'Your payment was verified.',
- REFUND_PENDING:'Your refund is pending review.',
- REFUND_COMPLETED:'Your refund was confirmed by the payment provider.',
- REFUND_REVIEW:'Your refund needs clinic assistance. Please contact the clinic.',
- BRIEFING:'A consented appointment briefing is available to clinic staff.',
-};
 type Options={pollMs:number;leaseMs:number;retryMs:number;maxAttempts:number;staleReminderMs:number};
 type Job={id:string;clinic_id:string;event:NotificationEvent;hold_id:string;expected_start:string|null;
- scheduled_at:number;attempts:number;lease_token:string;channel:Channel;language:string;timezone:string};
+ attempts:number;lease_token:string};
 type Terminal='SIMULATED'|'DELIVERED'|'MANUAL'|'SUPPRESSED';
 
 export class NotificationWorker {
@@ -67,11 +57,13 @@ export class NotificationWorker {
   this.db.prepare('UPDATE notification_jobs SET status=?,last_error=?,lease_token=NULL,lease_until=NULL WHERE id=?').run(status,reason,id);
  }
 
- private claim():Job|'SKIPPED'|undefined{
+ private claim():(Job&{message:NotificationMessage})|'SKIPPED'|undefined{
   const db=this.db,now=this.now();
   return transaction(db,()=>{
    const candidate=db.prepare(`SELECT j.*,o.clinic_id,p.enabled,p.channel AS preferred_channel,p.language,p.email_destination_hash,
-     json_extract(c.config,'$.timezone') AS timezone,
+     json_extract(c.config,'$.timezone') AS timezone,c.name AS clinic_name,d.name AS doctor_name,a.reference,
+     CASE WHEN j.event='PAYMENT_CONFIRMED' AND pay.currency='INR' THEN pay.amount
+          WHEN j.event='REFUND_COMPLETED' AND refund.currency='INR' AND refund.status='COMPLETED' THEN refund.amount END AS amount_paise,
      a.state AS booking_state,a.start AS booking_start,pay.state AS payment_state,
      (SELECT booking FROM consents WHERE clinic_id=o.clinic_id AND session_id=h.session_id ORDER BY created_at DESC,rowid DESC LIMIT 1) AS consent,
      (SELECT briefing FROM consents WHERE clinic_id=o.clinic_id AND session_id=h.session_id ORDER BY created_at DESC,rowid DESC LIMIT 1) AS briefing,
@@ -81,6 +73,8 @@ export class NotificationWorker {
     LEFT JOIN notification_preferences p ON p.session_id=h.session_id AND p.clinic_id=o.clinic_id
     LEFT JOIN appointments a ON a.id=o.appointment_id AND a.clinic_id=o.clinic_id
     LEFT JOIN payments pay ON pay.hold_id=h.id AND pay.clinic_id=o.clinic_id
+    LEFT JOIN doctors d ON d.id=a.doctor_id AND d.clinic_id=o.clinic_id
+    LEFT JOIN refund_operations refund ON refund.payment_ref=pay.id AND refund.clinic_id=o.clinic_id
     WHERE (j.status='PENDING' AND j.next_at<=?) OR (j.status='RUNNING' AND j.lease_until<=?)
     ORDER BY j.next_at,j.id LIMIT 1`).get(now,now);
    if(!candidate)return undefined;
@@ -110,6 +104,15 @@ export class NotificationWorker {
     return skip('MANUAL','CHANNEL_UNAVAILABLE');
    }
    if(Number(candidate.attempts)>=this.options.maxAttempts)return skip('MANUAL','RETRY_LIMIT');
+   let rendered:ReturnType<typeof renderNotification>;
+   try{
+    const email=channel==='EMAIL';
+    rendered=renderNotification({event,language:String(candidate.language),timezone:String(candidate.timezone),
+     start:candidate.expected_start as string|null,clinic:email?String(candidate.clinic_name):null,
+     doctor:email?candidate.doctor_name as string|null:null,reference:email?candidate.reference as string|null:null,
+     amountPaise:email?candidate.amount_paise as number|null:null});
+   }catch{return skip('MANUAL','RENDER_FAILED');}
+   if(!rendered)return skip('MANUAL','RENDER_FAILED');
    if(channel==='EMAIL'){
     const policy=this.provider.emailPolicy;
     if(!policy||candidate.clinic_id!==policy.clinicId||candidate.email_destination_hash!==policy.destinationHash){
@@ -125,17 +128,12 @@ export class NotificationWorker {
     }
     db.prepare('INSERT INTO email_submission_budget(reserved_at) VALUES(?)').run(now);
    }
-   return db.prepare(`UPDATE notification_jobs SET status='RUNNING',attempts=attempts+1,channel=?,lease_token=?,lease_until=?,provider_key=?
-     WHERE id=? RETURNING *,? AS clinic_id,? AS language,? AS timezone`)
-    .get(channel,randomUUID(),now+this.options.leaseMs,this.provider.key,id,candidate.clinic_id,candidate.language,candidate.timezone) as Job|undefined;
+   const job=db.prepare(`UPDATE notification_jobs SET status='RUNNING',attempts=attempts+1,channel=?,lease_token=?,lease_until=?,provider_key=?
+     WHERE id=? RETURNING *`)
+    .get(channel,randomUUID(),now+this.options.leaseMs,this.provider.key,id) as Job;
+   return {...job,message:{id,clinicId:String(candidate.clinic_id),channel,event,
+    audience:event==='BRIEFING'?'CLINIC':'PATIENT',...rendered}};
   });
- }
-
- private message(job:Job):NotificationMessage{
-  const includeTime=['CONFIRMATION','RESCHEDULE','REMINDER'].includes(job.event)&&job.expected_start;
-  const time=includeTime?new Intl.DateTimeFormat('en-GB',{dateStyle:'medium',timeStyle:'short',timeZone:job.timezone}).format(new Date(job.expected_start!)):'';
-  return {id:job.id,clinicId:job.clinic_id,channel:job.channel,language:job.language,audience:job.event==='BRIEFING'?'CLINIC':'PATIENT',
-   event:job.event,text:templates[job.event]+(time?` ${time} (${job.timezone}).`:'')};
  }
 
  async runOnce():Promise<boolean>{
@@ -147,7 +145,7 @@ export class NotificationWorker {
   let timeout:ReturnType<typeof setTimeout>|undefined;
   try{
    result=await Promise.race([
-    this.provider.deliver(this.message(job),controller.signal),
+    this.provider.deliver(job.message,controller.signal),
     new Promise<DeliveryResult>(resolve=>{
      timeout=setTimeout(()=>{controller.abort();resolve('AMBIGUOUS');},Math.max(1,Math.min(10000,this.options.leaseMs-1)));
     }),
@@ -161,7 +159,7 @@ export class NotificationWorker {
   const now=this.now(),delay=Math.min(3600000,this.options.retryMs*2**Math.min(job.attempts-1,16));
   const changed=this.db.prepare(`UPDATE notification_jobs SET status=?,last_error=?,next_at=?,lease_token=NULL,lease_until=NULL
    WHERE id=? AND lease_token=? AND lease_until>?`).run(status,reason,now+delay,job.id,job.lease_token,now);
-  if(changed.changes)this.log(JSON.stringify({event:'notification_attempt',id:job.id,kind:job.event,status,attempt:job.attempts}));
+  if(changed.changes)this.log(JSON.stringify({event:'notification_attempt',id:job.id,kind:job.message.event,status,attempt:job.attempts}));
   return true;
  }
 }
