@@ -11,6 +11,326 @@
     }
   ],
   "paths": {
+    "/api/notification-preferences": {
+      "post": {
+        "summary": "Set communication opt-in for the authenticated patient session",
+        "security": [
+          {
+            "ClinicId": [],
+            "PatientSession": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "ok": {
+                      "const": true
+                    },
+                    "data": {
+                      "type": "object",
+                      "properties": {
+                        "enabled": {
+                          "type": "boolean"
+                        },
+                        "channel": {
+                          "enum": [
+                            "CONSOLE",
+                            "EMAIL",
+                            "SMS",
+                            "WHATSAPP"
+                          ]
+                        },
+                        "language": {
+                          "enum": [
+                            "en",
+                            "kn",
+                            "hi"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "enabled",
+                        "channel",
+                        "language"
+                      ]
+                    },
+                    "requestId": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "ok",
+                    "data",
+                    "requestId"
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "VALIDATION_ERROR",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "SESSION_REQUIRED",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "ORIGIN_NOT_ALLOWED",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "RATE_LIMIT",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "INTERNAL_ERROR",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "enabled": {
+                    "type": "boolean"
+                  },
+                  "channel": {
+                    "enum": [
+                      "CONSOLE",
+                      "EMAIL",
+                      "SMS",
+                      "WHATSAPP"
+                    ],
+                    "default": "CONSOLE"
+                  },
+                  "language": {
+                    "enum": [
+                      "en",
+                      "kn",
+                      "hi"
+                    ],
+                    "default": "en"
+                  }
+                },
+                "required": [
+                  "enabled"
+                ],
+                "additionalProperties": false
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/admin/notifications": {
+      "get": {
+        "summary": "List clinic notification statuses",
+        "security": [
+          {
+            "AdminBearer": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "ok": {
+                      "const": true
+                    },
+                    "data": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "id": {
+                            "type": "string"
+                          },
+                          "event": {
+                            "enum": [
+                              "CONFIRMATION",
+                              "CANCELLATION",
+                              "RESCHEDULE",
+                              "REMINDER",
+                              "PAYMENT_CONFIRMED",
+                              "REFUND_PENDING",
+                              "REFUND_COMPLETED",
+                              "BRIEFING"
+                            ]
+                          },
+                          "channel": {
+                            "anyOf": [
+                              {
+                                "enum": [
+                                  "CONSOLE",
+                                  "EMAIL",
+                                  "SMS",
+                                  "WHATSAPP"
+                                ]
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ]
+                          },
+                          "status": {
+                            "enum": [
+                              "PENDING",
+                              "RUNNING",
+                              "SIMULATED",
+                              "DELIVERED",
+                              "SUPPRESSED",
+                              "MANUAL"
+                            ]
+                          },
+                          "attempts": {
+                            "type": "integer"
+                          },
+                          "scheduledAt": {
+                            "type": "integer"
+                          },
+                          "nextAttemptAt": {
+                            "anyOf": [
+                              {
+                                "type": "integer"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ]
+                          },
+                          "reason": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ]
+                          },
+                          "bookingReference": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ]
+                          }
+                        },
+                        "required": [
+                          "id",
+                          "event",
+                          "channel",
+                          "status",
+                          "attempts",
+                          "scheduledAt",
+                          "nextAttemptAt",
+                          "reason",
+                          "bookingReference"
+                        ]
+                      }
+                    },
+                    "requestId": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "ok",
+                    "data",
+                    "requestId"
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "ADMIN_AUTH_REQUIRED",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "ORIGIN_NOT_ALLOWED",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "RATE_LIMIT",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "INTERNAL_ERROR",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/admin/reconciliation": {
       "get": {
         "summary": "List unresolved reconciliation jobs for the authenticated clinic",

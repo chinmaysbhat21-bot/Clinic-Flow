@@ -2,6 +2,7 @@ import { randomUUID,randomInt,scryptSync,timingSafeEqual,createHmac } from 'node
 import { expireHolds,transaction,type DB } from './db.js';
 import type { BookingAdapter,Slot } from '../../../packages/shared/src/index.js';
 import { clinicDate,clinicHour } from './clinic-time.js';
+import { enqueueBookingNotice,enqueuePaymentNotice } from './notification-outbox.js';
 export class Fault extends Error {constructor(public code:string,message:string,public status=400){super(message);}}
 export function requireThat(ok:unknown,code:string,message=code,status=400):asserts ok {if(!ok)throw new Fault(code,message,status);}
 export function equal(a:string,b:string){const aa=Buffer.from(a),bb=Buffer.from(b);return aa.length===bb.length&&timingSafeEqual(aa,bb);}
@@ -72,7 +73,7 @@ export class Engine {
  transaction(this.db,()=>{if(!this.one("SELECT booking_key FROM booking_operations WHERE booking_key=? AND kind='CONFIRM'",id))return;this.run("UPDATE appointments SET state='CONFIRMED',external_id=? WHERE id=?",external,a.id);this.run("UPDATE holds SET state='CONFIRMED' WHERE id=?",id);this.notify(clinic,a.id,'CONFIRMATION');this.audit(clinic,'BOOKING_CONFIRMED',a.id);this.run('DELETE FROM booking_operations WHERE booking_key=?',id);});return this.booking(clinic,session,a.id);
  }catch{throw new Fault('CONFIRMATION_PENDING','Payment retained; retry confirmation with the same hold ID',503);}
  }
- notify(clinic:string,id:string,kind:string){this.run('INSERT OR IGNORE INTO outbox VALUES(?,?,?,?,?,?,?,?)',randomUUID(),clinic,id,kind,null,JSON.stringify({bookingId:id}),'SIMULATED',null);}
+ notify(clinic:string,id:string,kind:string){enqueueBookingNotice(this.db,clinic,id,kind,this.now());}
  async cancel(clinic:string,session:string,id:string){
   const a=transaction(this.db,()=>{
    const booking=this.booking(clinic,session,id);
@@ -88,7 +89,10 @@ export class Engine {
    if(!this.one("SELECT booking_key FROM booking_operations WHERE booking_key=? AND kind='CANCEL'",a.hold_id))return this.booking(clinic,session,id);
    const refundable=Date.parse(a.start)-this.now()>=this.clinic(clinic).config.refundCutoffHours*3600000;
    this.run('UPDATE appointments SET state=? WHERE id=?',refundable?'REFUND_PENDING':'CANCELLED',id);
-   if(refundable)this.run("UPDATE payments SET state='REFUND_PENDING' WHERE hold_id=?",a.hold_id);
+   if(refundable){
+    this.run("UPDATE payments SET state='REFUND_PENDING' WHERE hold_id=?",a.hold_id);
+    enqueuePaymentNotice(this.db,a.hold_id,'REFUND_PENDING',this.now());
+   }
    this.notify(clinic,id,'CANCELLATION');
    this.audit(clinic,'BOOKING_CANCELLED',id);
    this.run('DELETE FROM booking_operations WHERE booking_key=?',a.hold_id);
@@ -124,6 +128,17 @@ export class Engine {
    return this.booking(clinic,session,id);
   });
  }
- briefing(clinic:string,session:string,id:string,summary:string,destination?:string){const a=this.booking(clinic,session,id);requireThat(a.state==='CONFIRMED','BOOKING_NOT_CONFIRMED');this.consent(clinic,session,true);requireThat(destination,'BRIEFING_DESTINATION_NOT_CONFIGURED');requireThat(this.one('SELECT id FROM doctors WHERE id=? AND clinic_id=?',a.doctor_id,clinic),'INVALID_DOCTOR');transaction(this.db,()=>{this.run('INSERT OR IGNORE INTO briefings VALUES(?,?,?,?)',id,clinic,summary,this.now());this.run('INSERT OR IGNORE INTO outbox VALUES(?,?,?,?,?,?,?,?)',randomUUID(),clinic,id,'BRIEFING',destination,JSON.stringify({bookingId:id}),'SIMULATED',null);});return {status:'SIMULATED',delivered:false};}
+ briefing(clinic:string,session:string,id:string,summary:string,destination?:string){
+  return transaction(this.db,()=>{
+   const a=this.booking(clinic,session,id);
+   requireThat(a.state==='CONFIRMED','BOOKING_NOT_CONFIRMED');
+   this.consent(clinic,session,true);
+   requireThat(destination,'BRIEFING_DESTINATION_NOT_CONFIGURED');
+   requireThat(this.one('SELECT id FROM doctors WHERE id=? AND clinic_id=?',a.doctor_id,clinic),'INVALID_DOCTOR');
+   this.run('INSERT OR IGNORE INTO briefings VALUES(?,?,?,?)',id,clinic,summary,this.now());
+   this.notify(clinic,id,'BRIEFING');
+   return {status:'SIMULATED',delivered:false};
+  });
+ }
 }
 export function signature(secret:string,message:string|Buffer){return createHmac('sha256',secret).update(message).digest('hex');}

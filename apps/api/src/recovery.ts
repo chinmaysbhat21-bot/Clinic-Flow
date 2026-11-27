@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { type DB, transaction } from './db.js';
+import { enqueueBookingNotice,enqueuePaymentNotice } from './notification-outbox.js';
 
 type Operation = 'CONFIRM' | 'CANCEL' | 'RESCHEDULE';
 export type Evidence =
@@ -29,17 +30,23 @@ export function applyProviderEvidence(db: DB, evidence: Evidence, now: number) {
      if (!evidence.externalId) throw new Error('External booking ID is required');
      db.prepare("UPDATE appointments SET state='CONFIRMED',external_id=? WHERE id=?").run(evidence.externalId, appointment.id);
      db.prepare("UPDATE holds SET state='CONFIRMED' WHERE id=?").run(hold.id);
+     enqueueBookingNotice(db,evidence.clinicId,String(appointment.id),'CONFIRMATION',now);
     } else {
      db.prepare("UPDATE appointments SET state='REFUND_PENDING' WHERE id=?").run(appointment.id);
      db.prepare("UPDATE holds SET state='CANCELLED' WHERE id=?").run(hold.id);
      db.prepare("UPDATE payments SET state='REFUND_PENDING' WHERE hold_id=? AND state='VERIFIED'").run(hold.id);
+     enqueuePaymentNotice(db,String(hold.id),'REFUND_PENDING',now);
     }
    } else if (evidence.kind === 'CANCEL' && evidence.outcome === 'applied') {
     const clinic = db.prepare('SELECT config FROM clinics WHERE id=?').get(evidence.clinicId);
     const cutoff = JSON.parse(String(clinic?.config)).refundCutoffHours;
     const refundable = Date.parse(String(appointment.start)) - Number(operation.started_at) >= cutoff * 3600000;
     db.prepare('UPDATE appointments SET state=? WHERE id=?').run(refundable ? 'REFUND_PENDING' : 'CANCELLED', appointment.id);
-    if (refundable) db.prepare("UPDATE payments SET state='REFUND_PENDING' WHERE hold_id=?").run(hold.id);
+    if (refundable) {
+     db.prepare("UPDATE payments SET state='REFUND_PENDING' WHERE hold_id=?").run(hold.id);
+     enqueuePaymentNotice(db,String(hold.id),'REFUND_PENDING',now);
+    }
+    enqueueBookingNotice(db,evidence.clinicId,String(appointment.id),'CANCELLATION',now);
    } else if (evidence.kind === 'RESCHEDULE') {
     const replacement = db.prepare('SELECT * FROM holds WHERE id=? AND clinic_id=? AND session_id=?').get(operation.replacement_id, evidence.clinicId, hold.session_id);
     if (!replacement) throw new Error('Replacement hold is missing');
@@ -50,7 +57,7 @@ export function applyProviderEvidence(db: DB, evidence: Evidence, now: number) {
        OR EXISTS (SELECT 1 FROM booking_operations WHERE replacement_id=h.id))`).get(replacement.doctor_id, replacement.id, replacement.end, replacement.start, now);
      if (overlap || held) throw new Error('Replacement now conflicts. Resolve the provider conflict first.');
      db.prepare('UPDATE appointments SET start=?,end=? WHERE id=?').run(replacement.start, replacement.end, appointment.id);
-     db.prepare('INSERT OR IGNORE INTO outbox VALUES(?,?,?,?,?,?,?,?)').run(randomUUID(), evidence.clinicId, appointment.id, `RESCHEDULE_${replacement.id}`, null, JSON.stringify({bookingId:appointment.id}), 'SIMULATED', null);
+     enqueueBookingNotice(db,evidence.clinicId,String(appointment.id),`RESCHEDULE_${replacement.id}`,now);
     }
     db.prepare('UPDATE holds SET state=? WHERE id=?').run(evidence.outcome === 'applied' ? 'CONFIRMED' : 'CANCELLED', replacement.id);
    }

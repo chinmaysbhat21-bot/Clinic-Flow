@@ -1,5 +1,7 @@
 # Jay’s widget and dashboard contract
 
+Use the [notification contract](NOTIFICATION_SETUP.md) for patient opt-in and clinic delivery status. Console simulation does not indicate patient delivery.
+
 Set the API origin to `http://127.0.0.1:4000`. Add the exact frontend origin to ALLOWED_ORIGINS. Use [OpenAPI](openapi.yaml) for body and response schemas and [booking-flow.http](examples/booking-flow.http) for examples. Integration against BLOCKED routes is for isolated fictional fixtures only.
 
 | Screen | Call and expected result | UI behavior and next action |

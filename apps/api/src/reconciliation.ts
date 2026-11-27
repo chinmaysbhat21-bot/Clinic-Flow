@@ -131,8 +131,6 @@ export class ReconciliationWorker {
    const current=e.one('SELECT * FROM booking_operations WHERE booking_key=? AND kind=? AND started_at=?',ref,kind,job.generation);
    if(!current||current.replacement_id!==operation.replacement_id)return 'DONE';
    applyProviderEvidence(e.db,{kind,clinicId:job.clinic_id,holdId:ref,outcome:'applied',externalId},e.now());
-   if(kind==='CONFIRM')e.notify(job.clinic_id,appointment.id,'CONFIRMATION');
-   if(kind==='CANCEL')e.notify(job.clinic_id,appointment.id,'CANCELLATION');
    return 'DONE';
   });
  }
