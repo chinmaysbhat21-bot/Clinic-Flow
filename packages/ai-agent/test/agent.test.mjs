@@ -81,6 +81,33 @@ test("resolves a Kannada or Hindi doctor follow-up against verified clinic names
   }
 });
 
+test("resolves a Kannada or Hindi service follow-up against verified clinic names", async () => {
+  for (const language of ["kn", "hi"]) {
+    let secondContext;
+    let turn = 0;
+    const tools = { async executeTool(name) {
+      if (name === "getServices") return [{ id: "svc-1", name: "Dental cleaning" }];
+      if (name === "getDoctors") return [{ id: "doc-1", name: "Dr Demo Meera" }];
+      if (name === "getSlots") return [{ start: "2026-11-28T04:30:00.000Z", end: "2026-11-28T05:00:00.000Z" }];
+      throw new Error(`unexpected tool: ${name}`);
+    } };
+    const extractor = { async extract(_message, _language, _date, contextArg) {
+      if (turn++ === 0) return result("book_appointment", { doctor: "Dr Demo Meera", preferredDate: "2026-11-28", timePreference: "morning" });
+      secondContext = contextArg;
+      // Represents Gemini resolving a localized service mention to the verified catalog spelling.
+      return result("other", { service: contextArg.serviceOptions?.[0] ?? null });
+    } };
+    const agent = createAgent(tools, extractor, { now: () => new Date("2026-11-27T00:00:00Z") });
+    const first = await agent.handle({ message: "I want an appointment with Dr Demo Meera tomorrow morning", language: "en" }, context);
+    assert.match(first.message, /Which service/);
+    const followUp = await agent.handle({ message: language === "kn" ? "ಹಲ್ಲು ಸ್ವಚ್ಛಗೊಳಿಸುವಿಕೆ" : "दांतों की सफाई", language }, context, first.state);
+    assert.deepEqual(secondContext.serviceOptions, ["Dental cleaning"]);
+    assert.equal(followUp.state.serviceId, "svc-1");
+    assert.equal(followUp.state.doctorId, "doc-1");
+    assert.equal(followUp.actions[0].type, "SELECT_SLOT");
+  }
+});
+
 test("emergency detection short-circuits the model and does not invent contact details", async () => {
   let extracted = false;
   const agent = createAgent({ async executeTool() { throw new Error("no configured handoff"); } }, { async extract() { extracted = true; return result("other"); } });
