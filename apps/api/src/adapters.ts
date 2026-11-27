@@ -1,5 +1,6 @@
 import type { BookingAdapter,Slot } from '../../../packages/shared/src/index.js';
 import { Fault,requireThat } from './core.js';
+import type { GoogleOAuth } from './google-oauth.js';
 export async function remote(url:string,init:RequestInit={}){let r:Response;try{r=await fetch(url,{...init,signal:AbortSignal.timeout(10000)});}catch{throw new Fault('PROVIDER_UNAVAILABLE','External service unavailable',503);}if(!r.ok)throw new Fault('PROVIDER_REJECTED','External service rejected the operation',502);return r.status===204?{}:await r.json();}
 export class MockAdapter implements BookingAdapter {
  constructor(private base:string,private clinic:string,private key:string){}
@@ -36,16 +37,25 @@ export function googleCalendarId(clinic:string,mapping:string|undefined,legacy:s
 }
 
 export class GoogleAdapter implements BookingAdapter {
- constructor(private token:string,private calendar:string,private timezone='Asia/Kolkata',private fetcher=fetch){}
+ constructor(private token:string|GoogleOAuth,private calendar:string,private timezone='Asia/Kolkata',private fetcher=fetch){}
  private async request<T>(path:string,method='GET',body?:unknown,etag?:string):Promise<T>{
   requireThat(this.token&&this.calendar,'GOOGLE_NOT_CONFIGURED','Google Calendar credentials are required',503);
-  let response:Response;
-  try{
-   response=await this.fetcher(`https://www.googleapis.com/calendar/v3${path}`,{
-    method,headers:{Authorization:`Bearer ${this.token}`,'Content-Type':'application/json',...(etag?{'If-Match':etag}:{})},
-    body:body===undefined?undefined:JSON.stringify(body),signal:AbortSignal.timeout(10000),
-   });
-  }catch{throw new Fault('PROVIDER_UNAVAILABLE','Google Calendar unavailable',503);}
+  const send=async(token:string)=>{
+   try{
+    return await this.fetcher(`https://www.googleapis.com/calendar/v3${path}`,{
+     method,headers:{Authorization:`Bearer ${token}`,'Content-Type':'application/json',...(etag?{'If-Match':etag}:{})},
+     body:body===undefined?undefined:JSON.stringify(body),signal:AbortSignal.timeout(10000),
+    });
+   }catch{throw new Fault('PROVIDER_UNAVAILABLE','Google Calendar unavailable',503);}
+  };
+  const auth=this.token;
+  const token=typeof auth==='string'?auth:await auth.accessToken();
+  let response=await send(token);
+  // A definite authentication rejection is safe to retry. A timeout or 5xx is ambiguous.
+  if(response.status===401&&typeof auth!=='string'){
+   await response.body?.cancel().catch(()=>{});
+   response=await send(await auth.accessToken(token));
+  }
   if(!response.ok)throw new CalendarFault(response.status);
   return (response.status===204?undefined:await response.json()) as T;
  }

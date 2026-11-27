@@ -10,12 +10,14 @@ import * as contracts from '../../../packages/shared/src/index.js';
 import { Engine,Fault,requireThat,equal,signature } from './core.js';
 import { type DB,transaction } from './db.js';
 import { GoogleAdapter,MockAdapter,googleCalendarId } from './adapters.js';
+import { googleAuth } from './google-oauth.js';
 import { Payments,RazorpayProvider,type PaymentProvider } from './payments.js';
 export function createApp(db:DB,options:{mockBase?:string;mockKey:string;webhookSecret?:string;otpSink?:(id:string,code:string,phone:string)=>void;provider?:PaymentProvider;now?:()=>number;origins?:string[]} ){
  const app=express();app.disable('x-powered-by');
+ const google=googleAuth(process.env);
  const engine:Engine=new Engine(db,clinic=>{
   const {adapter,config}=engine.clinic(clinic);
-  if(adapter==='google')return new GoogleAdapter(process.env.GOOGLE_ACCESS_TOKEN??'',googleCalendarId(clinic,process.env.GOOGLE_CALENDARS_JSON,process.env.GOOGLE_CALENDAR_ID),config.timezone);
+  if(adapter==='google')return new GoogleAdapter(google,googleCalendarId(clinic,process.env.GOOGLE_CALENDARS_JSON,process.env.GOOGLE_CALENDAR_ID),config.timezone);
   return new MockAdapter(options.mockBase??'http://127.0.0.1:4000/mock',clinic,options.mockKey);
  },options.otpSink,options.now);
  const provider=options.provider??new RazorpayProvider(process.env.RAZORPAY_KEY_ID??'',process.env.RAZORPAY_KEY_SECRET??'');
@@ -85,7 +87,7 @@ export function createApp(db:DB,options:{mockBase?:string;mockKey:string;webhook
   next(err);
  });
  app.use(express.json({limit:'32kb'}));
- app.get('/api/health',(_req,res)=>{db.prepare('SELECT 1').get();ok(res,{database:'sqlite',status:'ok',otp:'DEVELOPMENT_ONLY',notifications:'SIMULATED',googleConfigured:!!process.env.GOOGLE_ACCESS_TOKEN,razorpayConfigured:!!process.env.RAZORPAY_KEY_ID});});
+ app.get('/api/health',(_req,res)=>{db.prepare('SELECT 1').get();ok(res,{database:'sqlite',status:'ok',otp:'DEVELOPMENT_ONLY',notifications:'SIMULATED',googleConfigured:!!google,razorpayConfigured:!!process.env.RAZORPAY_KEY_ID});});
  app.post('/api/sessions',(req,res)=>{const {clinicId}=z.object({clinicId:z.string()}).parse(req.body);engine.clinic(clinicId);const id=randomBytes(32).toString('hex');engine.run('INSERT INTO sessions VALUES(?,?,?,?)',id,clinicId,engine.now(),engine.now()+86400000);ok(res,{sessionId:id,clinicId,expiresAt:new Date(engine.now()+86400000).toISOString()},201);});
  app.get('/api/clinics/:id/config',(req,res)=>{const c=engine.clinic(String(req.params.id));ok(res,{id:c.id,name:c.name,...c.config});});
  app.get('/api/clinics/:id/doctors',(req,res)=>ok(res,engine.all('SELECT id,name,specialization,schedule FROM doctors WHERE clinic_id=? AND active=1',String(req.params.id)).map(d=>({...d,schedule:JSON.parse(d.schedule)}))));
