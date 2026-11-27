@@ -3,16 +3,30 @@ import { Engine,equal,requireThat,signature } from './core.js';
 import { transaction } from './db.js';
 import { remote } from './adapters.js';
 import { enqueuePaymentNotice } from './notification-outbox.js';
-export interface PaymentProvider {keyId:string;secret:string;assertConfigured?():void;order(amount:number,receipt:string):Promise<{id:string;amount:number;currency:string}>;payment(id:string):Promise<{id:string;order_id:string;amount:number;currency:string;status:string}>;
+import { enqueueRefund } from './refund-records.js';
+export type ProviderRefund={id:string;payment_id:string;amount:number;currency:string;status:string;receipt?:string|null};
+export interface PaymentProvider {keyId:string;secret:string;assertConfigured?():void;order(amount:number,receipt:string):Promise<{id:string;amount:number;currency:string}>;payment(id:string):Promise<{id:string;order_id:string;amount:number;currency:string;status:string;amount_refunded?:number;captured?:boolean}>;
  findOrder?(receipt:string):Promise<{id:string;amount:number;currency:string;receipt:string}|null>;
  findCapturedPayment?(orderId:string):Promise<string|null>;
+ refunds?(paymentId:string):Promise<ProviderRefund[]>;
+ refund?(id:string):Promise<ProviderRefund>;
+ createRefund?(paymentId:string,amount:number,operationId:string):Promise<ProviderRefund>;
 }
 export class RazorpayProvider implements PaymentProvider {
  constructor(public keyId:string,public secret:string){}
  assertConfigured(){requireThat(this.keyId.startsWith('rzp_test_')&&this.secret,'RAZORPAY_NOT_CONFIGURED','Razorpay test credentials required',503);}
- private request(path:string,body?:unknown){requireThat(this.keyId.startsWith('rzp_test_')&&this.secret,'RAZORPAY_NOT_CONFIGURED','Razorpay test credentials required',503);return remote(`https://api.razorpay.com/v1/${path}`,{method:body?'POST':'GET',headers:{Authorization:`Basic ${Buffer.from(`${this.keyId}:${this.secret}`).toString('base64')}`,'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined});}
+ private request(path:string,body?:unknown,idempotency?:string){this.assertConfigured();return remote(`https://api.razorpay.com/v1/${path}`,{method:body?'POST':'GET',headers:{Authorization:`Basic ${Buffer.from(`${this.keyId}:${this.secret}`).toString('base64')}`,'Content-Type':'application/json',...(idempotency?{'X-Refund-Idempotency':idempotency}:{})},body:body?JSON.stringify(body):undefined});}
  order(amount:number,receipt:string){return this.request('orders',{amount,currency:'INR',receipt});}
  payment(id:string){return this.request(`payments/${encodeURIComponent(id)}`);}
+ async refunds(paymentId:string):Promise<ProviderRefund[]>{
+  const list=await this.request(`payments/${encodeURIComponent(paymentId)}/refunds?count=100`);
+  requireThat(Array.isArray(list.items)&&list.items.length<100,'PROVIDER_REJECTED','Refund listing could not be verified',502);
+  return list.items;
+ }
+ refund(id:string):Promise<ProviderRefund>{return this.request(`refunds/${encodeURIComponent(id)}`);}
+ createRefund(paymentId:string,amount:number,operationId:string):Promise<ProviderRefund>{
+  return this.request(`payments/${encodeURIComponent(paymentId)}/refund`,{amount,receipt:operationId,speed:'normal'},operationId);
+ }
  async findOrder(receipt:string){
   const list=await this.request('orders?'+new URLSearchParams({receipt,count:'10'}));
   const matches=list.items.filter((item:{receipt:string})=>item.receipt===receipt);
@@ -81,7 +95,8 @@ export class Payments {
    const eligible=hold.state==='PAYMENT_PENDING'&&hold.expires_at>e.now();
    e.run('UPDATE payments SET state=?,payment_id=? WHERE id=?',eligible?'VERIFIED':'REFUND_PENDING',paymentId,current.id);
    if(eligible)e.run("UPDATE holds SET state='PAYMENT_VERIFIED' WHERE id=?",holdId);
-   enqueuePaymentNotice(e.db,holdId,eligible?'PAYMENT_CONFIRMED':'REFUND_PENDING',e.now());
+   if(eligible)enqueuePaymentNotice(e.db,holdId,'PAYMENT_CONFIRMED',e.now());
+   else enqueueRefund(e.db,holdId,'EXPIRED_RESERVATION',e.now());
    e.audit(clinic,eligible?'PAYMENT_VERIFIED':'LATE_PAYMENT_RECONCILIATION',current.id);
    return {state:eligible?'PAYMENT_VERIFIED':'REFUND_PENDING'};
   });

@@ -11,6 +11,307 @@
     }
   ],
   "paths": {
+    "/api/admin/refunds": {
+      "get": {
+        "summary": "List refund operations for the authenticated clinic",
+        "security": [
+          {
+            "AdminBearer": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "ok": {
+                      "const": true
+                    },
+                    "data": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "id": {
+                            "type": "string"
+                          },
+                          "amount": {
+                            "type": "integer"
+                          },
+                          "currency": {
+                            "const": "INR"
+                          },
+                          "reason": {
+                            "enum": [
+                              "ELIGIBLE_CANCELLATION",
+                              "EXPIRED_RESERVATION",
+                              "BOOKING_NOT_CREATED"
+                            ]
+                          },
+                          "status": {
+                            "enum": [
+                              "PENDING",
+                              "PROCESSING",
+                              "COMPLETED",
+                              "MANUAL"
+                            ]
+                          },
+                          "attempts": {
+                            "type": "integer"
+                          },
+                          "reviewReason": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ]
+                          },
+                          "createdAt": {
+                            "type": "integer"
+                          },
+                          "completedAt": {
+                            "anyOf": [
+                              {
+                                "type": "integer"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ]
+                          },
+                          "bookingReference": {
+                            "anyOf": [
+                              {
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ]
+                          }
+                        },
+                        "required": [
+                          "id",
+                          "amount",
+                          "currency",
+                          "reason",
+                          "status",
+                          "attempts",
+                          "reviewReason",
+                          "createdAt",
+                          "completedAt",
+                          "bookingReference"
+                        ]
+                      }
+                    },
+                    "requestId": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "ok",
+                    "data",
+                    "requestId"
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "ADMIN_AUTH_REQUIRED",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "ORIGIN_NOT_ALLOWED",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "RATE_LIMIT",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "INTERNAL_ERROR",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/holds/{id}/refund": {
+      "get": {
+        "summary": "Read refund status for a hold owned by the authenticated session",
+        "security": [
+          {
+            "ClinicId": [],
+            "PatientSession": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "ok": {
+                      "const": true
+                    },
+                    "data": {
+                      "type": "object",
+                      "properties": {
+                        "status": {
+                          "enum": [
+                            "PENDING",
+                            "PROCESSING",
+                            "COMPLETED",
+                            "MANUAL",
+                            "NOT_APPLICABLE"
+                          ]
+                        },
+                        "amount": {
+                          "anyOf": [
+                            {
+                              "type": "integer"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        },
+                        "currency": {
+                          "anyOf": [
+                            {
+                              "const": "INR"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        },
+                        "completedAt": {
+                          "anyOf": [
+                            {
+                              "type": "integer"
+                            },
+                            {
+                              "type": "null"
+                            }
+                          ]
+                        }
+                      },
+                      "required": [
+                        "status",
+                        "amount",
+                        "currency",
+                        "completedAt"
+                      ]
+                    },
+                    "requestId": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "ok",
+                    "data",
+                    "requestId"
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "SESSION_REQUIRED",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "ORIGIN_NOT_ALLOWED",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "NOT_FOUND",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "RATE_LIMIT",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "INTERNAL_ERROR",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ]
+      }
+    },
     "/api/notification-preferences": {
       "post": {
         "summary": "Set communication opt-in for the authenticated patient session",
@@ -197,6 +498,7 @@
                               "PAYMENT_CONFIRMED",
                               "REFUND_PENDING",
                               "REFUND_COMPLETED",
+                              "REFUND_REVIEW",
                               "BRIEFING"
                             ]
                           },
@@ -2553,8 +2855,8 @@
     },
     "/api/payments/webhook": {
       "post": {
-        "summary": "Reconcile payment.captured and payment.failed",
-        "description": "Reconcile payment.captured and payment.failed. Verifies original raw bytes, deduplicates by event ID or body digest, and uses atomic payment reconciliation. Other signed events are acknowledged. No automatic confirmation.",
+        "summary": "Reconcile signed payment and refund events",
+        "description": "Verifies raw bytes and deduplicates by event ID or body digest. Captured and failed payment events invoke payment reconciliation. refund.created, refund.processed, refund.failed and refund.speed_changed trigger authoritative refund lookup for an existing submitted operation. No automatic booking confirmation.",
         "x-implementation-status": "BLOCKED",
         "x-owner": "Chinmay",
         "x-source": "apps/api/src/server.ts:createApp",

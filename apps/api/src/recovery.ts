@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { type DB, transaction } from './db.js';
-import { enqueueBookingNotice,enqueuePaymentNotice } from './notification-outbox.js';
+import { enqueueBookingNotice } from './notification-outbox.js';
+import { enqueueRefund } from './refund-records.js';
 
 type Operation = 'CONFIRM' | 'CANCEL' | 'RESCHEDULE';
 export type Evidence =
@@ -35,7 +36,7 @@ export function applyProviderEvidence(db: DB, evidence: Evidence, now: number) {
      db.prepare("UPDATE appointments SET state='REFUND_PENDING' WHERE id=?").run(appointment.id);
      db.prepare("UPDATE holds SET state='CANCELLED' WHERE id=?").run(hold.id);
      db.prepare("UPDATE payments SET state='REFUND_PENDING' WHERE hold_id=? AND state='VERIFIED'").run(hold.id);
-     enqueuePaymentNotice(db,String(hold.id),'REFUND_PENDING',now);
+     enqueueRefund(db,String(hold.id),'BOOKING_NOT_CREATED',now);
     }
    } else if (evidence.kind === 'CANCEL' && evidence.outcome === 'applied') {
     const clinic = db.prepare('SELECT config FROM clinics WHERE id=?').get(evidence.clinicId);
@@ -44,7 +45,7 @@ export function applyProviderEvidence(db: DB, evidence: Evidence, now: number) {
     db.prepare('UPDATE appointments SET state=? WHERE id=?').run(refundable ? 'REFUND_PENDING' : 'CANCELLED', appointment.id);
     if (refundable) {
      db.prepare("UPDATE payments SET state='REFUND_PENDING' WHERE hold_id=?").run(hold.id);
-     enqueuePaymentNotice(db,String(hold.id),'REFUND_PENDING',now);
+     enqueueRefund(db,String(hold.id),'ELIGIBLE_CANCELLATION',now);
     }
     enqueueBookingNotice(db,evidence.clinicId,String(appointment.id),'CANCELLATION',now);
    } else if (evidence.kind === 'RESCHEDULE') {

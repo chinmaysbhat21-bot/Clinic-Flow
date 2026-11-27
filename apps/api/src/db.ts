@@ -2,7 +2,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { randomUUID,scryptSync } from 'node:crypto';
-import { enqueuePaymentNotice } from './notification-outbox.js';
+import { enqueueRefund } from './refund-records.js';
 export function openDb(path:string){
  if(path!==':memory:')mkdirSync(dirname(path),{recursive:true});
  const db=new DatabaseSync(path); db.exec('PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;');
@@ -27,6 +27,16 @@ export function openDb(path:string){
  CREATE TABLE IF NOT EXISTS payment_webhook_events(
   id TEXT PRIMARY KEY, body_hash TEXT NOT NULL, processed_at INTEGER
  );
+ CREATE TABLE IF NOT EXISTS refund_operations(
+  id TEXT PRIMARY KEY, payment_ref TEXT NOT NULL UNIQUE REFERENCES payments(id),
+  clinic_id TEXT NOT NULL REFERENCES clinics(id), appointment_id TEXT REFERENCES appointments(id),
+  amount INTEGER NOT NULL CHECK(amount>=100), currency TEXT NOT NULL CHECK(currency='INR'),
+  reason TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'PENDING',
+  provider_refund_id TEXT UNIQUE, approved_at INTEGER, submitted_at INTEGER, attempts INTEGER NOT NULL DEFAULT 0,
+  next_at INTEGER NOT NULL, lease_until INTEGER, lease_token TEXT, last_error TEXT,
+  created_at INTEGER NOT NULL, completed_at INTEGER
+ );
+ CREATE INDEX IF NOT EXISTS refund_due ON refund_operations(status,next_at,lease_until);
  CREATE TABLE IF NOT EXISTS booking_operations(
   booking_key TEXT PRIMARY KEY REFERENCES holds(id), kind TEXT NOT NULL,
   replacement_id TEXT REFERENCES holds(id), started_at INTEGER NOT NULL
@@ -73,7 +83,7 @@ export function expireHolds(db:DB, now:number, holdId?:string) {
   AND NOT EXISTS (SELECT 1 FROM appointments WHERE hold_id=holds.id)`;
  const args = [now, holdId ?? null, holdId ?? null] as const;
  const expired=db.prepare(`UPDATE payments SET state='REFUND_PENDING' WHERE state='VERIFIED' AND hold_id IN (${eligible}) RETURNING hold_id`).all(...args);
- for(const payment of expired)enqueuePaymentNotice(db,String(payment.hold_id),'REFUND_PENDING',now);
+ for(const payment of expired)enqueueRefund(db,String(payment.hold_id),'EXPIRED_RESERVATION',now);
  db.prepare(`UPDATE holds SET state='EXPIRED' WHERE id IN (${eligible})`).run(...args);
 }
 export function transaction<T>(db:DB,fn:()=>T):T {db.exec('BEGIN IMMEDIATE');try{const result=fn();db.exec('COMMIT');return result;}catch(e){db.exec('ROLLBACK');throw e;}}

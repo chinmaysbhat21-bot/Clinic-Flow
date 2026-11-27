@@ -18,6 +18,7 @@ Base URL is `http://127.0.0.1:4000`. Send `Content-Type: application/json` for J
 | `GET /api/slots` | patient | IMPLEMENTED AND VERIFIED |
 | `POST /api/holds` | patient | IMPLEMENTED AND VERIFIED |
 | `GET /api/holds/{id}` | patient | IMPLEMENTED BUT UNVERIFIED |
+| `GET /api/holds/{id}/refund` | patient | IMPLEMENTED AND VERIFIED |
 | `DELETE /api/holds/{id}` | patient | IMPLEMENTED BUT UNVERIFIED |
 | `POST /api/otp/send` | patient | PARTIALLY IMPLEMENTED |
 | `POST /api/otp/verify` | patient | IMPLEMENTED AND VERIFIED |
@@ -48,6 +49,7 @@ Base URL is `http://127.0.0.1:4000`. Send `Content-Type: application/json` for J
 | `POST /api/admin/blocks` | admin | IMPLEMENTED BUT UNVERIFIED |
 | `GET /api/admin/blocks` | admin | IMPLEMENTED BUT UNVERIFIED |
 | `GET /api/admin/payments` | admin | IMPLEMENTED BUT UNVERIFIED |
+| `GET /api/admin/refunds` | admin | IMPLEMENTED AND VERIFIED |
 | `GET /api/admin/audit-logs` | admin | IMPLEMENTED BUT UNVERIFIED |
 | `GET /api/admin/outbox` | admin | IMPLEMENTED BUT UNVERIFIED |
 | `POST /api/admin/appointments/{id}/{action}` | admin | BLOCKED |
@@ -70,7 +72,7 @@ Base URL is `http://127.0.0.1:4000`. Send `Content-Type: application/json` for J
 | Consent, OTPVerification | Shared request validators. Consent accepts literal booking=true and optional briefing flag. OTP accepts international phone and six-digit string. Never serialize OTP records. |
 | AvailabilitySlot, SlotHold | Shared `Slot` and hold request. Hold response projection uses id, start, end, fee in paise, expires_at in milliseconds, state. |
 | PaymentOrder, PaymentStatus | Inline checkout response with keyId, orderId, amount and INR. Shared PaymentStatus enum. Verification response mixes booking and payment states. |
-| Appointment, AppointmentStatus, RefundStatus | Shared BookingStatus combines multiple lifecycle concepts. No independent runtime refund status schema. Project appointment fields explicitly. |
+| Appointment, AppointmentStatus, RefundStatus | Shared BookingStatus combines several lifecycle concepts. The separate [refund status contract](REFUND_SETUP.md) reports the durable refund operation without exposing provider identifiers. |
 | ChatRequest, ChatResponse | PROPOSED in [AI tool contract](AI_TOOL_CONTRACT.md). |
 | ChatAction | Existing shared five-way discriminated union; no active HTTP producer. |
 | ToolRequest, ToolResponse | Existing name-to-Zod argument map and trusted context. No uniform result validator. |
@@ -83,7 +85,7 @@ Base URL is `http://127.0.0.1:4000`. Send `Content-Type: application/json` for J
 
 ## Proposed or missing capabilities
 
-No standalone readiness endpoint, session refresh/revoke, admin appointment details, refund execution or reconciliation endpoint, delivery-status workflow, or separate OTP resend endpoint exists. Resend uses the existing OTP send route. For admin details, a proposed `GET /api/admin/appointments/{id}` would return a clinic-scoped appointment projection or 404. A proposed readiness probe would report dependency readiness separately from liveness. Refund reconciliation should begin as a backend operation with provider confirmation and audit events. Chat input and output are proposed separately. None of these proposals changes the current OpenAPI paths.
+No standalone readiness endpoint, session refresh/revoke, admin appointment details, public refund submission, or separate OTP resend endpoint exists. Resend uses the existing OTP send route. For admin details, a proposed `GET /api/admin/appointments/{id}` would return a clinic-scoped appointment projection or 404. A proposed readiness probe would report dependency readiness separately from liveness. Chat input and output are proposed separately. None of these proposals changes the current OpenAPI paths.
 
 ## Versioning
 

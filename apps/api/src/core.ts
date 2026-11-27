@@ -2,7 +2,8 @@ import { randomUUID,randomInt,scryptSync,timingSafeEqual,createHmac } from 'node
 import { expireHolds,transaction,type DB } from './db.js';
 import type { BookingAdapter,Slot } from '../../../packages/shared/src/index.js';
 import { clinicDate,clinicHour } from './clinic-time.js';
-import { enqueueBookingNotice,enqueuePaymentNotice } from './notification-outbox.js';
+import { enqueueBookingNotice } from './notification-outbox.js';
+import { enqueueRefund } from './refund-records.js';
 export class Fault extends Error {constructor(public code:string,message:string,public status=400){super(message);}}
 export function requireThat(ok:unknown,code:string,message=code,status=400):asserts ok {if(!ok)throw new Fault(code,message,status);}
 export function equal(a:string,b:string){const aa=Buffer.from(a),bb=Buffer.from(b);return aa.length===bb.length&&timingSafeEqual(aa,bb);}
@@ -77,7 +78,7 @@ export class Engine {
  async cancel(clinic:string,session:string,id:string){
   const a=transaction(this.db,()=>{
    const booking=this.booking(clinic,session,id);
-   if(['CANCELLED','REFUND_PENDING'].includes(booking.state))return booking;
+   if(['CANCELLED','REFUND_PENDING','REFUNDED'].includes(booking.state))return booking;
    requireThat(booking.state==='CONFIRMED','INVALID_STATE');
    requireThat(!this.one('SELECT booking_key FROM booking_operations WHERE booking_key=?',booking.hold_id),'INVALID_STATE','Booking operation pending reconciliation');
    this.run("INSERT INTO booking_operations VALUES(?,'CANCEL',NULL,?)",booking.hold_id,this.now());
@@ -91,7 +92,7 @@ export class Engine {
    this.run('UPDATE appointments SET state=? WHERE id=?',refundable?'REFUND_PENDING':'CANCELLED',id);
    if(refundable){
     this.run("UPDATE payments SET state='REFUND_PENDING' WHERE hold_id=?",a.hold_id);
-    enqueuePaymentNotice(this.db,a.hold_id,'REFUND_PENDING',this.now());
+    enqueueRefund(this.db,a.hold_id,'ELIGIBLE_CANCELLATION',this.now());
    }
    this.notify(clinic,id,'CANCELLATION');
    this.audit(clinic,'BOOKING_CANCELLED',id);

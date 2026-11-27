@@ -31,6 +31,7 @@ const templates:Record<NotificationEvent,string>={
  PAYMENT_CONFIRMED:'Your payment was verified.',
  REFUND_PENDING:'Your refund is pending review.',
  REFUND_COMPLETED:'Your refund was confirmed by the payment provider.',
+ REFUND_REVIEW:'Your refund needs clinic assistance. Please contact the clinic.',
  BRIEFING:'A consented appointment briefing is available to clinic staff.',
 };
 type Options={pollMs:number;leaseMs:number;retryMs:number;maxAttempts:number;staleReminderMs:number};
@@ -102,7 +103,7 @@ export class NotificationWorker {
    if(event==='CANCELLATION'&&!['CANCELLED','REFUND_PENDING','REFUNDED'].includes(String(candidate.booking_state))){
     return skip('SUPPRESSED','BOOKING_CHANGED');
    }
-   const paymentState:Partial<Record<NotificationEvent,string>>={PAYMENT_CONFIRMED:'VERIFIED',REFUND_PENDING:'REFUND_PENDING',REFUND_COMPLETED:'REFUNDED'};
+   const paymentState:Partial<Record<NotificationEvent,string>>={PAYMENT_CONFIRMED:'VERIFIED',REFUND_PENDING:'REFUND_PENDING',REFUND_COMPLETED:'REFUNDED',REFUND_REVIEW:'REFUND_PENDING'};
    if(paymentState[event]&&paymentState[event]!==candidate.payment_state)return skip('SUPPRESSED','PAYMENT_CHANGED');
    if(!this.provider.channels.includes(channel)||(event==='BRIEFING'&&channel!=='CONSOLE')){
     return skip('MANUAL','CHANNEL_UNAVAILABLE');
