@@ -13,8 +13,9 @@ Copy `.env.example` to `.env` locally and choose a development admin password. I
 - [Errors](docs/ERROR_CODES.md)
 - [Integration checklist](docs/INTEGRATION_CHECKLIST.md)
 - [HTTP examples](docs/examples/booking-flow.http)
+- [Nandan's AI agent package](packages/ai-agent/README.md)
 
-The local test suite uses a stateful mock clinic and a payment fixture. Shared integration is blocked on the remaining concurrency issues documented above. Chat is a stub. Use fictional data only.
+The local test suite uses a stateful mock clinic and a payment fixture. Booking mutations retain the concurrency risks documented above. Use fictional data only.
 
 ## Patient widget
 

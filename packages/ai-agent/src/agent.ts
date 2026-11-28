@@ -2,7 +2,7 @@ import { z } from "zod";
 import { bookingStateText, emergencyGuidancePrefix, text } from "./locales.js";
 import { isPossibleEmergency } from "./safety.js";
 import { DoctorSchema, FAQSchema, ServiceSchema, SlotSchema, parseIsoDate } from "./schemas.js";
-import type { AgentConfig, AgentState, AgentTools, ChatAction, ChatRequest, ChatResponse, ClinicInfo, Doctor, FAQ, IntentExtractor, Service, Slot, ToolContext } from "./types.js";
+import type { AgentConfig, AgentState, AgentTools, ChatAction, ChatRequest, ChatResponse, ClinicInfo, Doctor, FAQ, ExtractionFailureDiagnostic, IntentExtractor, Service, Slot, ToolContext } from "./types.js";
 
 const BookingSchema = z.object({
   id: z.string(),
@@ -63,24 +63,31 @@ export function createAgent(tools: AgentTools, extractor: IntentExtractor, confi
 
       let extracted;
       let currentDate: string;
+      let failureStage: "context_preparation" | "intent_extraction" = "context_preparation";
       try {
         currentDate = new Intl.DateTimeFormat("en-CA", {
           timeZone: config.timezone ?? "Asia/Kolkata",
           year: "numeric", month: "2-digit", day: "2-digit",
         }).format(now());
-        extracted = await extractor.extract(request.message, language, currentDate, {
+        const extractionContext = {
           intent: state.intent,
           serviceName: state.serviceName,
           doctorName: state.doctorName,
           preferredDate: state.preferredDate,
           timePreference: state.timePreference,
-        });
-      } catch {
+          ...(previous.intent === "book_appointment" || previous.intent === "availability"
+            ? await verifiedCatalogNames(tools, context, !state.doctorId, !state.serviceId)
+            : {}),
+        };
+        failureStage = "intent_extraction";
+        extracted = await extractor.extract(request.message, language, currentDate, extractionContext);
+      } catch (error) {
+        reportExtractionFailure(config.onExtractionFailure, failureStage, error);
         const actions = state.userMessageCount >= 2 ? await handoffAction(tools, context) : [];
         return response(state.userMessageCount >= 2 ? text(language, "toolFailure") : text(language, "needMore"), language, state, actions);
       }
 
-      const followUpIntent = previous.intent === "book_appointment" && (extracted.intent === "other" || extracted.intent === "search_services" || extracted.intent === "search_doctors");
+      const followUpIntent = (previous.intent === "book_appointment" || previous.intent === "availability") && (extracted.intent === "other" || extracted.intent === "search_services" || extracted.intent === "search_doctors");
       state.intent = followUpIntent ? previous.intent : extracted.intent;
       const attachBriefingCandidate = (reply: ChatResponse): ChatResponse => {
         const concern = extracted.intent === "medical_advice" ? null : extracted.patientReportedConcern?.trim().slice(0, 2000);
@@ -118,6 +125,39 @@ export function createAgent(tools: AgentTools, extractor: IntentExtractor, confi
       return attachBriefingCandidate(response(text(language, "generic"), language, state));
     },
   };
+}
+
+function reportExtractionFailure(
+  callback: AgentConfig["onExtractionFailure"],
+  stage: "context_preparation" | "intent_extraction",
+  error: unknown,
+): void {
+  if (!callback) return;
+  const diagnostic: ExtractionFailureDiagnostic = { stage, kind: "unexpected_error" };
+  if (error instanceof z.ZodError || error instanceof SyntaxError) {
+    diagnostic.kind = "invalid_output";
+  } else if (error instanceof Error && error.name === "TimeoutError") {
+    diagnostic.kind = "timeout";
+  } else if (error && typeof error === "object") {
+    const providerError = error as { status?: unknown; statusCode?: unknown };
+    const status = providerError.statusCode ?? providerError.status;
+    if (typeof status === "number" && Number.isInteger(status) && status >= 400 && status <= 599) {
+      diagnostic.kind = "provider_error";
+      diagnostic.status = status;
+    }
+  }
+  try { callback(diagnostic); } catch { /* Diagnostics must never change the chat response. */ }
+}
+
+async function verifiedCatalogNames(tools: AgentTools, context: ToolContext, includeDoctors: boolean, includeServices: boolean): Promise<{ doctorOptions?: string[]; serviceOptions?: string[] }> {
+  const [doctorResult, serviceResult] = await Promise.all([
+    includeDoctors ? callTool(tools, "getDoctors", {}, context).catch(() => null) : Promise.resolve(null),
+    includeServices ? callTool(tools, "getServices", {}, context).catch(() => null) : Promise.resolve(null),
+  ]);
+  const result: { doctorOptions?: string[]; serviceOptions?: string[] } = {};
+  if (doctorResult !== null) result.doctorOptions = z.array(DoctorSchema).parse(doctorResult).map((doctor) => doctor.name).slice(0, 50);
+  if (serviceResult !== null) result.serviceOptions = z.array(ServiceSchema).parse(serviceResult).map((service) => service.name).slice(0, 50);
+  return result;
 }
 
 async function bookOrFindSlots(
