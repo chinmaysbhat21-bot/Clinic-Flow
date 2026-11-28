@@ -124,4 +124,12 @@ export interface AgentConfig {
   now?: () => Date;
   timezone?: string;
   maxSlots?: number;
+  /** Receives a sanitized failure category without provider messages or request content. */
+  onExtractionFailure?: (diagnostic: ExtractionFailureDiagnostic) => void;
+}
+
+export interface ExtractionFailureDiagnostic {
+  stage: "context_preparation" | "intent_extraction";
+  kind: "invalid_output" | "timeout" | "provider_error" | "unexpected_error";
+  status?: number;
 }

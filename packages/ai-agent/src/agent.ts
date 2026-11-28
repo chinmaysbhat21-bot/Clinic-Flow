@@ -2,7 +2,7 @@ import { z } from "zod";
 import { bookingStateText, emergencyGuidancePrefix, text } from "./locales.js";
 import { isPossibleEmergency } from "./safety.js";
 import { DoctorSchema, FAQSchema, ServiceSchema, SlotSchema, parseIsoDate } from "./schemas.js";
-import type { AgentConfig, AgentState, AgentTools, ChatAction, ChatRequest, ChatResponse, ClinicInfo, Doctor, FAQ, IntentExtractor, Service, Slot, ToolContext } from "./types.js";
+import type { AgentConfig, AgentState, AgentTools, ChatAction, ChatRequest, ChatResponse, ClinicInfo, Doctor, FAQ, ExtractionFailureDiagnostic, IntentExtractor, Service, Slot, ToolContext } from "./types.js";
 
 const BookingSchema = z.object({
   id: z.string(),
@@ -63,6 +63,7 @@ export function createAgent(tools: AgentTools, extractor: IntentExtractor, confi
 
       let extracted;
       let currentDate: string;
+      let failureStage: "context_preparation" | "intent_extraction" = "context_preparation";
       try {
         currentDate = new Intl.DateTimeFormat("en-CA", {
           timeZone: config.timezone ?? "Asia/Kolkata",
@@ -78,8 +79,10 @@ export function createAgent(tools: AgentTools, extractor: IntentExtractor, confi
             ? await verifiedCatalogNames(tools, context, !state.doctorId, !state.serviceId)
             : {}),
         };
+        failureStage = "intent_extraction";
         extracted = await extractor.extract(request.message, language, currentDate, extractionContext);
-      } catch {
+      } catch (error) {
+        reportExtractionFailure(config.onExtractionFailure, failureStage, error);
         const actions = state.userMessageCount >= 2 ? await handoffAction(tools, context) : [];
         return response(state.userMessageCount >= 2 ? text(language, "toolFailure") : text(language, "needMore"), language, state, actions);
       }
@@ -122,6 +125,31 @@ export function createAgent(tools: AgentTools, extractor: IntentExtractor, confi
       return attachBriefingCandidate(response(text(language, "generic"), language, state));
     },
   };
+}
+
+function reportExtractionFailure(
+  callback: AgentConfig["onExtractionFailure"],
+  stage: "context_preparation" | "intent_extraction",
+  error: unknown,
+): void {
+  if (!callback) return;
+  const diagnostic: ExtractionFailureDiagnostic = {
+    stage,
+    kind: "unexpected_error",
+  };
+  if (error instanceof z.ZodError || error instanceof SyntaxError) {
+    diagnostic.kind = "invalid_output";
+  } else if (error instanceof Error && error.name === "TimeoutError") {
+    diagnostic.kind = "timeout";
+  } else if (error && typeof error === "object") {
+    const providerError = error as { status?: unknown; statusCode?: unknown };
+    const status = providerError.statusCode ?? providerError.status;
+    if (typeof status === "number" && Number.isInteger(status) && status >= 400 && status <= 599) {
+      diagnostic.kind = "provider_error";
+      diagnostic.status = status;
+    }
+  }
+  try { callback(diagnostic); } catch { /* Diagnostics must never change the chat response. */ }
 }
 
 async function verifiedCatalogNames(tools: AgentTools, context: ToolContext, includeDoctors: boolean, includeServices: boolean): Promise<{ doctorOptions?: string[]; serviceOptions?: string[] }> {

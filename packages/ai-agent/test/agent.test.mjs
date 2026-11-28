@@ -8,6 +8,35 @@ const result = (intent, values = {}) => ({
   timePreference: null, bookingId: null, faqTopic: null, patientReportedConcern: null, ...values,
 });
 
+test("reports sanitized extraction failure diagnostics without changing the fallback", async () => {
+  let diagnostic;
+  const sensitiveText = "patient prompt and GEMINI_API_KEY=do-not-log";
+  const tools = { async executeTool() { throw new Error("unexpected tool call"); } };
+  const extractor = { async extract() { throw new Error(sensitiveText); } };
+  const agent = createAgent(tools, extractor, {
+    onExtractionFailure(value) { diagnostic = value; },
+  });
+
+  const reply = await agent.handle({ message: sensitiveText, language: "en" }, context);
+  assert.equal(reply.state.userMessageCount, 1);
+  assert.deepEqual(diagnostic, { stage: "intent_extraction", kind: "unexpected_error" });
+  assert.doesNotMatch(JSON.stringify(diagnostic), /patient prompt|GEMINI_API_KEY|do-not-log/);
+});
+
+test("includes only the HTTP status for a provider extraction error", async () => {
+  let diagnostic;
+  const providerError = Object.assign(new Error("private provider response"), { statusCode: 429 });
+  const agent = createAgent(
+    { async executeTool() { throw new Error("unexpected tool call"); } },
+    { async extract() { throw providerError; } },
+    { onExtractionFailure(value) { diagnostic = value; } },
+  );
+
+  await agent.handle({ message: "Book an appointment", language: "en" }, context);
+  assert.deepEqual(diagnostic, { stage: "intent_extraction", kind: "provider_error", status: 429 });
+  assert.doesNotMatch(JSON.stringify(diagnostic), /private provider response/);
+});
+
 test("extracts in one turn and shows only backend-provided matching slots", async () => {
   const calls = [];
   const tools = { async executeTool(name, input, ctx) {
