@@ -43,3 +43,5 @@
   .clinic-chat-message { max-width: 92%; font-size: 16px; }
 }
 @media (prefers-reduced-motion: reduce) { .clinic-chat-widget *, .clinic-chat-widget *::before, .clinic-chat-widget *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; transition-duration: .01ms !important; } }
+.clinic-chat-embedded { inset: 0; }
+.clinic-chat-embedded .clinic-chat-panel { position: static; width: 100%; height: 100%; min-height: 0; box-sizing: border-box; }

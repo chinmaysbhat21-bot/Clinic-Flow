@@ -397,7 +397,7 @@
     },
     "/api/admin/appointments/{id}": {
       "get": {
-        "summary": "GET /api/admin/appointments/{id}",
+        "summary": "Get clinic-scoped appointment details and its consented patient-reported briefing",
         "security": [
           {
             "AdminBearer": []
@@ -461,6 +461,10 @@
                             "integer",
                             "null"
                           ]
+                        },
+                        "patientBriefing": {
+                          "type": "string",
+                          "description": "Optional stored patient-reported visit summary. Returned for confirmed appointments only while briefing consent remains active."
                         },
                         "duration": {
                           "type": [
@@ -3475,8 +3479,8 @@
     "/api/payments/verify": {
       "post": {
         "summary": "Capture verification works with fixture",
-        "description": "Capture verification works with fixture. Shared use blocked by callback race. Verify signature, order, currency, amount and captured status. Does not confirm booking.",
-        "x-implementation-status": "BLOCKED",
+        "description": "Checks the signature and authoritative provider payment, order, amount, currency and capture status. Browser callbacks and webhook reconciliation share atomic state transitions. Payment verification does not confirm an appointment.",
+        "x-implementation-status": "IMPLEMENTED AND VERIFIED",
         "x-owner": "Chinmay",
         "x-source": "apps/api/src/server.ts:createApp",
         "security": [
@@ -3830,8 +3834,8 @@
     "/api/bookings/confirm": {
       "post": {
         "summary": "Requires consent, verified phone and captured payment",
-        "description": "Requires consent, verified phone and captured payment. Returns confirmed record on repeat; pending retry uses same hold ID. Shared use blocked by races and raw responses.",
-        "x-implementation-status": "BLOCKED",
+        "description": "Requires consent, verified phone and captured payment. A repeat for an already confirmed hold returns the same booking. On CONFIRMATION_PENDING keep and reuse the same hold ID. Returns an allowlisted patient appointment projection.",
+        "x-implementation-status": "IMPLEMENTED AND VERIFIED",
         "x-owner": "Chinmay",
         "x-source": "apps/api/src/server.ts:createApp",
         "security": [
@@ -3852,7 +3856,7 @@
                       "const": true
                     },
                     "data": {
-                      "$ref": "#/components/schemas/AppointmentProjection"
+                      "$ref": "#/components/schemas/PatientAppointmentConfirmation"
                     },
                     "requestId": {
                       "type": "string"
@@ -8650,6 +8654,74 @@
           "end",
           "state"
         ]
+      },
+      "PatientAppointmentConfirmation": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "reference": {
+            "type": "string"
+          },
+          "doctor_id": {
+            "type": "string"
+          },
+          "service_id": {
+            "type": "string"
+          },
+          "start": {
+            "type": "string",
+            "format": "date-time",
+            "pattern": "Z$"
+          },
+          "end": {
+            "type": "string",
+            "format": "date-time",
+            "pattern": "Z$"
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "AVAILABLE",
+              "HELD",
+              "OTP_VERIFIED",
+              "PAYMENT_PENDING",
+              "PAYMENT_VERIFIED",
+              "CONFIRMATION_PENDING",
+              "CONFIRMED",
+              "EXPIRED",
+              "CANCELLED",
+              "PAYMENT_FAILED",
+              "REFUND_PENDING",
+              "REFUNDED"
+            ]
+          },
+          "fee": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "duration": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "reference",
+          "doctor_id",
+          "service_id",
+          "start",
+          "end",
+          "state",
+          "fee",
+          "duration"
+        ],
+        "additionalProperties": false
       },
       "HoldProjection": {
         "type": "object",

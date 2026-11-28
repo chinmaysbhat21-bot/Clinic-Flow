@@ -23,9 +23,9 @@ Base URL is `http://127.0.0.1:4000`. Send `Content-Type: application/json` for J
 | `POST /api/otp/send` | patient | PARTIALLY IMPLEMENTED |
 | `POST /api/otp/verify` | patient | IMPLEMENTED AND VERIFIED |
 | `POST /api/payments/order` | patient | PARTIALLY IMPLEMENTED |
-| `POST /api/payments/verify` | patient | BLOCKED |
+| `POST /api/payments/verify` | patient | IMPLEMENTED AND VERIFIED with payment fixtures. |
 | `POST /api/payments/webhook` | webhook | HTTP 200 means durable receipt; provider reconciliation runs in the background. HTTP 503 requests redelivery after storage or mapping failure. [External Test Mode delivery pending](RAZORPAY_WEBHOOK_SETUP.md). |
-| `POST /api/bookings/confirm` | patient | BLOCKED |
+| `POST /api/bookings/confirm` | patient | IMPLEMENTED AND VERIFIED with booking fixtures. Returns a patient-safe projection. |
 | `GET /api/bookings/{id}` | patient | BLOCKED |
 | `POST /api/bookings/{id}/cancel` | patient | BLOCKED |
 | `POST /api/bookings/{id}/reschedule` | patient | BLOCKED |
@@ -79,7 +79,7 @@ Base URL is `http://127.0.0.1:4000`. Send `Content-Type: application/json` for J
 | PatientBriefing | Shared request accepts a patient-reported summary of 1–2000 characters; response only acknowledges simulation. |
 | APIError | Shared TypeScript ApiResponse union; current error schema in OpenAPI. No shared runtime response validators. |
 
-**Unsafe current responses.** Hold, appointment and several tool handlers return raw records. Admin appointment list and action responses return only the seven fields in AppointmentProjection. The OpenAPI appointment and hold schemas describe the visible useful fields, not complete raw bodies or a guarantee of redaction. Restrict blocked routes to isolated local testing. Do not persist, display or forward internal fields.
+**Unsafe current responses.** Hold, other patient booking routes and several tool handlers return raw records. Booking confirmation returns an explicit allowlist. Admin appointment list and action responses return only the seven fields in AppointmentProjection. The OpenAPI appointment and hold schemas describe the visible useful fields, not complete raw bodies or a guarantee of redaction. Restrict blocked routes to isolated local testing. Do not persist, display or forward internal fields.
 
 **Proposed safe contract.** Keep paths and envelopes, and extend field allowlists to patient appointment and hold responses. Review these with Jay and Nandan before adopting. Add separate schemas for appointment, payment verification, and refund states. This changes current serialization and needs approval.
 

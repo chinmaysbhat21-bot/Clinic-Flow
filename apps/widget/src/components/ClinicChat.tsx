@@ -31,7 +31,7 @@ function actionText(action: ChatAction, language: ChatLanguage): string | null {
   return null
 }
 
-export default function ClinicChat({ clinicId = 'lotus', bookingUrl = '/embed.html?clinicId=lotus&mode=page' }: { clinicId?: string; bookingUrl?: string }) {
+export default function ClinicChat({ clinicId = 'lotus', bookingUrl = '/embed.html?clinicId=lotus&mode=page', embedded = false }: { clinicId?: string; bookingUrl?: string; embedded?: boolean }) {
   const [open, setOpen] = useState(false)
   const [language, setLanguage] = useState<ChatLanguage>('en')
   const [messages, setMessages] = useState<ChatMessage[]>([{ id: 0, role: 'assistant', text: copy.en.welcome }])
@@ -87,7 +87,12 @@ export default function ClinicChat({ clinicId = 'lotus', bookingUrl = '/embed.ht
       setMessages((current) => [...current, { id: messageId.current++, role: 'assistant', text: reply.message, actions: reply.actions }])
       if (actionMessages.length) setMessages((current) => [...current, ...actionMessages.map((text) => ({ id: messageId.current++, role: 'assistant' as const, text }))])
     } catch (reason) {
-      setError(friendlyError(reason, language))
+      const bookingRequest = /^(?:appointments?|book(?: an? appointment)?|booking|ಅಪಾಯಿಂಟ್‌ಮೆಂಟ್|ಬುಕಿಂಗ್|अपॉइंटमेंट|बुकिंग)[.!?]?$/iu.test(message)
+      if (embedded && bookingRequest && reason instanceof ApiError && reason.code === 'AI_MODULE_NOT_CONNECTED') {
+        setMessages((current) => [...current, { id: messageId.current++, role: 'assistant', text: words.transaction }])
+      } else {
+        setError(friendlyError(reason, language))
+      }
     } finally {
       setLoading(false)
       latestInput.current?.focus()
@@ -106,13 +111,13 @@ export default function ClinicChat({ clinicId = 'lotus', bookingUrl = '/embed.ht
     }
   }
 
-  return <div className="clinic-chat-widget">
-    {open && <section className="clinic-chat-panel" role="dialog" aria-modal="false" aria-labelledby="clinic-chat-title">
+  return <div className={embedded ? "clinic-chat-widget clinic-chat-embedded" : "clinic-chat-widget"}>
+    {(open || embedded) && <section className="clinic-chat-panel" role="dialog" aria-modal="false" aria-labelledby="clinic-chat-title">
       <header className="clinic-chat-header">
         <img src="/clinicflow-logo.png" alt="" className="clinic-chat-logo" />
         <div className="clinic-chat-heading"><strong id="clinic-chat-title">{words.title}</strong><span><i aria-hidden="true" />{words.online}</span></div>
         <label className="clinic-chat-language"><span className="sr-only">{words.language}</span><select value={language} onChange={(event) => setLanguage(event.target.value as ChatLanguage)} aria-label={words.language}><option value="en">EN</option><option value="kn">ಕನ್ನಡ</option><option value="hi">हिन्दी</option></select></label>
-      <button className="clinic-chat-close" type="button" onClick={() => { setOpen(false); launcher.current?.focus() }} aria-label="Close chat"><X size={22} /></button>
+      {!embedded && <button className="clinic-chat-close" type="button" onClick={() => { setOpen(false); launcher.current?.focus() }} aria-label="Close chat"><X size={22} /></button>}
       </header>
       <div className="clinic-chat-messages" ref={messageList} aria-live="polite" aria-relevant="additions text">
         {messages.map((message) => <article className={`clinic-chat-message ${message.role}`} key={message.id}>
@@ -130,8 +135,8 @@ export default function ClinicChat({ clinicId = 'lotus', bookingUrl = '/embed.ht
       </form>
       <p className="clinic-chat-hint">Enter to send · Shift+Enter for a new line</p>
     </section>}
-    <button ref={launcher} className={`clinic-chat-launcher${open ? ' is-open' : ''}`} type="button" aria-expanded={open} aria-haspopup="dialog" aria-label={open ? 'Close clinic chat' : 'Open clinic chat'} onClick={() => setOpen((value) => !value)}>
+    {!embedded && <button ref={launcher} className={`clinic-chat-launcher${open ? ' is-open' : ''}`} type="button" aria-expanded={open} aria-haspopup="dialog" aria-label={open ? 'Close clinic chat' : 'Open clinic chat'} onClick={() => setOpen((value) => !value)}>
       {open ? <X size={25} /> : <><MessageCircle size={23} /><span>Ask the clinic</span><Headset className="clinic-chat-launcher-extra" size={19} /></>}
-    </button>
+    </button>}
   </div>
 }

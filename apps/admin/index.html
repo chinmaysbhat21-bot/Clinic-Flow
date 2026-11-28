@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ClinicFlow Admin</title>
+<link rel="stylesheet" href="./styles.css">
+<script type="module" src="./dashboard.js"></script>
+</head>
+<body>
+<header class="header">
+  <a class="brand" href="./">ClinicFlow <span>Admin</span></a>
+  <div id="account" hidden><span id="clinic"></span><span id="session-expiry"></span><button type="button" id="logout" class="secondary">Sign out</button></div>
+</header>
+<main>
+  <p id="status" role="status" aria-live="polite"></p>
+  <section id="login-panel" class="card login">
+    <h1>Clinic sign-in</h1>
+    <form id="login">
+      <label>Email <input name="email" type="email" autocomplete="username" required></label>
+      <label>Password <input name="password" type="password" autocomplete="current-password" required></label>
+      <button type="submit">Sign in</button>
+    </form>
+  </section>
+  <section id="dashboard" hidden>
+    <div class="section-head"><h1 tabindex="-1" id="title">Clinic overview</h1><button id="refresh" type="button" class="secondary">Refresh</button></div>
+    <dl id="metrics" class="metrics"></dl>
+    <section class="card">
+      <h2>Appointments</h2>
+      <form id="filters" class="filters">
+        <label>Booking reference <input name="search" maxlength="100" placeholder="Search by reference"></label>
+        <label>Status <select name="state"><option value="">All statuses</option><option value="CONFIRMED">Confirmed</option><option value="CONFIRMATION_PENDING">Confirmation pending</option><option value="CANCELLED">Cancelled</option><option value="REFUND_PENDING">Refund pending</option><option value="REFUNDED">Refunded</option></select></label>
+        <label>From <input name="from" type="date"></label>
+        <label>To <input name="to" type="date"></label>
+        <button type="submit">Apply filters</button>
+      </form>
+      <p id="appointment-status" role="status"></p>
+      <div class="table-scroll"><table aria-label="Appointments"><thead><tr><th scope="col">Reference</th><th scope="col">Clinic time</th><th scope="col">Doctor</th><th scope="col">Service</th><th scope="col">Status</th></tr></thead><tbody id="appointments"></tbody></table></div>
+    </section>
+    <section class="card">
+      <h2>Doctors</h2>
+      <ul id="doctor-list" class="doctor-list"></ul>
+      <form id="edit-doctor" class="doctor-form" hidden>
+        <h3>Edit doctor profile</h3>
+        <label>Doctor name <input name="name" maxlength="100" required></label>
+        <label>Specialisation <input name="specialization" maxlength="100" required></label>
+        <label class="inline-check"><input type="checkbox" name="active"> Available for new bookings</label>
+        <div class="actions"><button type="submit">Save doctor</button><button type="button" id="close-doctor" class="secondary">Close editor</button></div>
+        <p id="doctor-edit-status" role="status"></p>
+      </form>
+      <details>
+        <summary>Add doctor</summary>
+        <form id="add-doctor" class="doctor-form">
+          <label>Doctor name <input name="name" maxlength="100" required></label>
+          <label>Specialisation <input name="specialization" maxlength="100" required></label>
+          <fieldset>
+            <legend>Available days</legend>
+            <div class="choices">
+              <label><input name="days" type="checkbox" value="1" checked> Mon</label>
+              <label><input name="days" type="checkbox" value="2" checked> Tue</label>
+              <label><input name="days" type="checkbox" value="3" checked> Wed</label>
+              <label><input name="days" type="checkbox" value="4" checked> Thu</label>
+              <label><input name="days" type="checkbox" value="5" checked> Fri</label>
+              <label><input name="days" type="checkbox" value="6"> Sat</label>
+              <label><input name="days" type="checkbox" value="0"> Sun</label>
+            </div>
+          </fieldset>
+          <div class="filters">
+            <label>Start hour (0–23) <input name="start" type="number" min="0" max="23" step="1" value="9" required></label>
+            <label>End hour (1–24) <input name="end" type="number" min="1" max="24" step="1" value="17" required></label>
+          </div>
+          <fieldset><legend>Services offered</legend><div id="doctor-services" class="choices"></div></fieldset>
+          <button type="submit" disabled>Add doctor</button>
+          <p id="doctor-status" role="status"></p>
+        </form>
+      </details>
+    </section>
+    <section class="card">
+      <h2>Services</h2>
+      <ul id="service-list" class="doctor-list"></ul>
+      <details id="service-editor">
+        <summary>Add or edit a service</summary>
+        <form id="service-form" class="doctor-form">
+          <label>Service name <input name="name" maxlength="100" required></label>
+          <div class="filters">
+            <label>Duration (minutes) <input name="duration" type="number" min="5" max="240" required></label>
+            <label>Fee (₹) <input name="fee" type="number" min="1" max="100000" step="0.01" required></label>
+          </div>
+          <label>Description <textarea name="description" maxlength="500"></textarea></label>
+          <label class="inline-check"><input type="checkbox" name="active" checked> Available for new bookings</label>
+          <div class="actions"><button type="submit">Save service</button><button type="button" id="new-service" class="secondary">New service</button></div>
+          <p id="service-status" role="status"></p>
+        </form>
+      </details>
+    </section>
+    <section class="card">
+      <h2>Clinic settings</h2>
+      <details>
+        <summary>Edit clinic hours and contact</summary>
+        <form id="clinic-form" class="doctor-form">
+          <label>Time zone <input name="timezone" required></label>
+          <div class="filters">
+            <label>Opening hour (0–23) <input name="start" type="number" min="0" max="23" required></label>
+            <label>Closing hour (1–24) <input name="end" type="number" min="1" max="24" required></label>
+          </div>
+          <label>Clinic contact <input name="handoff" maxlength="100"></label>
+          <div><button type="submit">Save clinic settings</button></div>
+          <p id="clinic-status" role="status"></p>
+        </form>
+      </details>
+    </section>
+    <section class="card">
+      <h2>Operations</h2>
+      <label>Queue <select id="queue"><option value="reconciliation">Reconciliation</option><option value="refunds">Refunds</option><option value="notifications">Notifications</option></select></label>
+      <p id="operations-status" role="status"></p>
+      <div class="table-scroll"><table aria-label="Operations"><thead><tr><th scope="col">Type</th><th scope="col">Booking reference</th><th scope="col">Status</th><th scope="col">Details</th></tr></thead><tbody id="operations"></tbody></table></div>
+    </section>
+  </section>
+</main>
+<dialog id="detail" aria-labelledby="detail-title">
+  <form method="dialog"><button type="submit" class="secondary">Close</button></form>
+  <h2 id="detail-title">Appointment details</h2>
+  <div id="detail-content" aria-live="polite"></div>
+</dialog>
+</body>
+</html>

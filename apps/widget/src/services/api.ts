@@ -14,7 +14,7 @@ export type ClinicConfig = {
   faqs: Array<{ question: string; answer: string }>
   refundCutoffHours: number
 }
-export type Doctor = { id: string; name: string; schedule: { days: number[]; start: number; end: number } }
+export type Doctor = { id: string; name: string; specialization?: string; schedule: { days: number[]; start: number; end: number } }
 export type Service = { id: string; clinic_id: string; name: string; duration: number; fee: number; active: number }
 export type ApiSlot = { start: string; end: string }
 export type SlotHold = { id: string; start: string; end: string; fee: number; expires_at: number; state: string }

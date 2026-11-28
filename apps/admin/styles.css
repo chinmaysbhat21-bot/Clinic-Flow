@@ -1,0 +1,53 @@
+:root {font-family:system-ui,sans-serif;color:#152b31;background:#eff4f4;line-height:1.5;--brand:#086458;--border:#cbd9d9}
+* {box-sizing:border-box}
+[hidden] {display:none!important}
+body {margin:0}
+.header {background:#13373a;color:white;display:flex;align-items:center;justify-content:space-between;padding:1rem max(1rem,calc((100vw - 72rem)/2));gap:.75rem}
+.brand {color:white;text-decoration:none;font-weight:750;font-size:1.3rem}
+.brand span {font-weight:400;color:#c3e8e3;margin-left:.35rem}
+#account {display:flex;align-items:center;gap:.75rem;flex-wrap:wrap}
+main {max-width:72rem;margin:auto;padding:1rem}
+.card {background:white;border:1px solid var(--border);border-radius:1rem;padding:clamp(1rem,3vw,1.5rem);margin-bottom:1rem}
+.login {max-width:28rem;margin:3rem auto}
+h1,h2 {line-height:1.2;margin:0 0 1rem}
+h1 {font-size:clamp(1.6rem,4vw,2rem)}
+h2 {font-size:1.25rem}
+form,label {display:grid;gap:.4rem}
+form {gap:1rem}
+label {font-weight:600}
+input,select,button {font:inherit;min-height:44px;border-radius:.5rem;padding:.55rem .8rem}
+input,select {width:100%;min-width:0;border:1px solid #789092;background:white;color:#152b31}
+button {cursor:pointer;border:1px solid var(--brand);background:var(--brand);color:white;font-weight:650}
+button.secondary,button.link {background:white;color:#07574c}
+button.link {border:0;padding:.35rem;text-decoration:underline}
+button:disabled {opacity:.65;cursor:wait}
+:focus-visible {outline:3px solid #a64100;outline-offset:3px}
+.section-head {display:flex;align-items:baseline;justify-content:space-between;gap:1rem}
+.metrics {display:grid;grid-template-columns:repeat(auto-fit,minmax(10rem,1fr));gap:.75rem;margin:0 0 1rem}
+.metrics div {background:white;border:1px solid var(--border);padding:1rem;border-radius:.75rem}
+.metrics dd {margin:0;font-size:1.5rem;font-weight:750}
+.filters {display:grid;grid-template-columns:repeat(auto-fit,minmax(9rem,1fr));align-items:end}
+.table-scroll {overflow:auto}
+table {border-collapse:collapse;width:100%;text-align:left}
+th,td {padding:.65rem;border-bottom:1px solid var(--border);vertical-align:top}
+th {background:#e7f2ef}
+#status:not(:empty) {background:#e1f1ed;padding:.65rem .85rem;border-radius:.5rem}
+dialog {width:min(32rem,calc(100% - 2rem));border:1px solid var(--border);border-radius:1rem;padding:1.25rem}
+dialog::backdrop {background:#142b31aa}
+dialog form {display:flex;justify-content:flex-end}
+dt {font-weight:650}
+dd {margin:0 0 .65rem;overflow-wrap:anywhere}
+.doctor-form {margin-top:1rem;max-width:40rem}
+.doctor-list {padding-left:1.25rem}
+summary {cursor:pointer;color:#07574c;font-weight:700}
+fieldset {border:1px solid var(--border);border-radius:.5rem;min-width:0}
+.choices {display:flex;flex-wrap:wrap;gap:.35rem 1rem}
+.choices label {display:flex;align-items:center;gap:.35rem;min-height:44px}
+.choices input {width:1rem;min-height:auto;padding:0}
+.visit-summary {white-space:pre-wrap;overflow-wrap:anywhere;background:#eff4f4;padding:.75rem;border-radius:.5rem}
+
+textarea {font:inherit;min-height:5rem;padding:.55rem .8rem;border:1px solid #789092;border-radius:.5rem;resize:vertical}
+.inline-check,.actions {display:flex;align-items:center;gap:.6rem;flex-wrap:wrap}
+.inline-check input {width:1rem;min-height:auto}
+#session-expiry {font-size:.875rem;color:#c3e8e3}
+.doctor-list li {margin-bottom:.35rem}

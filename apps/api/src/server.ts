@@ -11,13 +11,15 @@ import { buildPatientBriefing, createAgent, GeminiIntentExtractor, type AgentSta
 import { Engine,Fault,requireThat,equal,signature } from './core.js';
 import { type DB,transaction } from './db.js';
 import { GoogleAdapter,MockAdapter,googleCalendarId } from './adapters.js';
+import { googleAuth } from './google-oauth.js';
 import { Payments,RazorpayProvider,type PaymentProvider } from './payments.js';
 import { executeTool } from './tools.js';
 export function createApp(db:DB,options:{mockBase?:string;mockKey:string;webhookSecret?:string;otpSink?:(id:string,code:string,phone:string)=>void;provider?:PaymentProvider;now?:()=>number;origins?:string[];intentExtractor?:IntentExtractor;briefingDestination?:string} ){
  const app=express();app.disable('x-powered-by');
+ const google=googleAuth(process.env);
  const engine:Engine=new Engine(db,clinic=>{
   const {adapter,config}=engine.clinic(clinic);
-  if(adapter==='google')return new GoogleAdapter(process.env.GOOGLE_ACCESS_TOKEN??'',googleCalendarId(clinic,process.env.GOOGLE_CALENDARS_JSON,process.env.GOOGLE_CALENDAR_ID),config.timezone);
+  if(adapter==='google')return new GoogleAdapter(google,googleCalendarId(clinic,process.env.GOOGLE_CALENDARS_JSON,process.env.GOOGLE_CALENDAR_ID),config.timezone);
   return new MockAdapter(options.mockBase??'http://127.0.0.1:4000/mock',clinic,options.mockKey);
  },options.otpSink,options.now);
  const provider=options.provider??new RazorpayProvider(process.env.RAZORPAY_KEY_ID??'',process.env.RAZORPAY_KEY_SECRET??'');
@@ -90,7 +92,7 @@ export function createApp(db:DB,options:{mockBase?:string;mockKey:string;webhook
   next(err);
  });
  app.use(express.json({limit:'32kb'}));
- app.get('/api/health',(_req,res)=>{db.prepare('SELECT 1').get();ok(res,{database:'sqlite',status:'ok',otp:'DEVELOPMENT_ONLY',notifications:'SIMULATED',googleConfigured:!!process.env.GOOGLE_ACCESS_TOKEN,razorpayConfigured:!!process.env.RAZORPAY_KEY_ID});});
+ app.get('/api/health',(_req,res)=>{db.prepare('SELECT 1').get();ok(res,{database:'sqlite',status:'ok',otp:'DEVELOPMENT_ONLY',notifications:'SIMULATED',googleConfigured:!!google,razorpayConfigured:!!process.env.RAZORPAY_KEY_ID});});
  app.post('/api/sessions',(req,res)=>{const {clinicId}=z.object({clinicId:z.string()}).parse(req.body);engine.clinic(clinicId);const id=randomBytes(32).toString('hex');engine.run('INSERT INTO sessions VALUES(?,?,?,?)',id,clinicId,engine.now(),engine.now()+86400000);ok(res,{sessionId:id,clinicId,expiresAt:new Date(engine.now()+86400000).toISOString()},201);});
  app.get('/api/clinics/:id/config',(req,res)=>{const c=engine.clinic(String(req.params.id));ok(res,{id:c.id,name:c.name,...c.config});});
  app.get('/api/clinics/:id/doctors',(req,res)=>ok(res,engine.all('SELECT id,name,specialization,schedule FROM doctors WHERE clinic_id=? AND active=1',String(req.params.id)).map(d=>({...d,schedule:JSON.parse(d.schedule)}))));
@@ -116,19 +118,19 @@ export function createApp(db:DB,options:{mockBase?:string;mockKey:string;webhook
 
  // ── Admin middleware: validate session and populate locals ────────────────
  app.use('/api/admin',(req,res,next)=>{
-  const token=req.headers.authorization?.replace(/^Bearer /,'');
+  const token=/^Bearer ([a-f0-9]{64})$/i.exec(req.headers.authorization??'')?.[1];
   const a=token&&engine.one('SELECT s.*,a.role FROM admin_sessions s JOIN admins a ON a.id=s.admin_id AND a.clinic_id=s.clinic_id WHERE s.token_hash=? AND s.expires_at>?',hash(token),engine.now());
   if(!a)return next(new Fault('ADMIN_AUTH_REQUIRED','Admin authentication required',401));
   res.locals.clinic=a.clinic_id;
   res.locals.adminId=String(a.admin_id);
   res.locals.adminRole=String(a.role);
+  res.locals.adminTokenHash=a.token_hash;
   next();
  });
 
  // ── Admin logout ──────────────────────────────────────────────────────────
  app.delete('/api/admin/session',(req,res)=>{
-  const token=req.headers.authorization?.replace(/^Bearer /,'');
-  if(token)engine.run('DELETE FROM admin_sessions WHERE token_hash=?',hash(token));
+  engine.run('DELETE FROM admin_sessions WHERE token_hash=?',res.locals.adminTokenHash);
   engine.auditDetails(res.locals.clinic,'ADMIN_LOGOUT',res.locals.adminId,res.locals.adminId);
   ok(res,{loggedOut:true});
  });
@@ -165,9 +167,13 @@ export function createApp(db:DB,options:{mockBase?:string;mockKey:string;webhook
   ));
  });
  app.get('/api/admin/appointments/:id',(req,res)=>{
-  const a=engine.one('SELECT * FROM appointments WHERE id=? AND clinic_id=?',String(req.params.id),res.locals.clinic);
+  const a=engine.one(`SELECT a.*,b.summary AS patientBriefing FROM appointments a
+   LEFT JOIN briefings b ON b.appointment_id=a.id AND b.clinic_id=a.clinic_id AND a.state='CONFIRMED' AND 1=(
+    SELECT CASE WHEN c.booking=1 AND c.briefing=1 THEN 1 ELSE 0 END FROM consents c
+    WHERE c.clinic_id=a.clinic_id AND c.session_id=a.session_id ORDER BY c.created_at DESC,c.rowid DESC LIMIT 1)
+   WHERE a.id=? AND a.clinic_id=?`,String(req.params.id),res.locals.clinic);
   requireThat(a,'NOT_FOUND',undefined,404);
-  ok(res,contracts.adminAppointmentDetail.parse(a));
+  ok(res,contracts.adminAppointmentDetail.parse({...a,patientBriefing:a.patientBriefing??undefined}));
  });
 
  // ── Admin overview / summary ──────────────────────────────────────────────
@@ -364,7 +370,11 @@ export function createApp(db:DB,options:{mockBase?:string;mockKey:string;webhook
  app.post('/api/otp/verify',(req,res)=>{const p=contracts.otpRequest.parse(req.body);ok(res,engine.verifyOtp(res.locals.clinic,res.locals.session,p.holdId,p.phone,p.code));});
  app.post('/api/payments/order',async(req,res)=>ok(res,await payments.order(res.locals.clinic,res.locals.session,contracts.holdIdRequest.parse(req.body).holdId)));
  app.post('/api/payments/verify',async(req,res)=>ok(res,await payments.verify(res.locals.clinic,res.locals.session,contracts.paymentVerifyRequest.parse(req.body))));
- app.post('/api/bookings/confirm',async(req,res)=>ok(res,await engine.confirm(res.locals.clinic,res.locals.session,contracts.holdIdRequest.parse(req.body).holdId)));
+ app.post('/api/bookings/confirm',async(req,res)=>{
+  const {holdId}=contracts.holdIdRequest.parse(req.body);
+  const booking=await engine.confirm(res.locals.clinic,res.locals.session,holdId);
+  ok(res,contracts.patientAppointmentConfirmation.parse(booking));
+ });
  app.get('/api/holds/:id',(req,res)=>ok(res,engine.hold(res.locals.clinic,res.locals.session,String(req.params.id),false)));
  app.get('/api/holds/:id/refund',(req,res)=>{
   const hold=engine.hold(res.locals.clinic,res.locals.session,String(req.params.id),false);
@@ -381,7 +391,7 @@ export function createApp(db:DB,options:{mockBase?:string;mockKey:string;webhook
  app.post('/api/bookings/:id/reschedule',async(req,res)=>ok(res,await engine.reschedule(res.locals.clinic,res.locals.session,String(req.params.id),contracts.holdIdRequest.parse(req.body).holdId)));
  app.post('/api/bookings/:id/briefing',(req,res)=>ok(res,engine.briefing(res.locals.clinic,res.locals.session,String(req.params.id),contracts.briefingRequest.parse(req.body).patientReportedSummary,process.env.BRIEFING_TEST_EMAIL)));
  app.get('/api/bookings/:id/calendar.ics',(req,res)=>{const a=engine.booking(res.locals.clinic,res.locals.session,String(req.params.id));requireThat(a.state==='CONFIRMED','BOOKING_NOT_CONFIRMED');const dt=(v:string)=>v.replace(/[-:]/g,'').replace(/\.\d{3}/,'');res.type('text/calendar').setHeader('Content-Disposition','attachment; filename="appointment.ics"');res.send(['BEGIN:VCALENDAR','VERSION:2.0','PRODID:-//Almost Humans//Booking//EN','BEGIN:VEVENT',`UID:${a.id}@almost-humans.invalid`,`DTSTAMP:${dt(new Date(engine.now()).toISOString())}`,`DTSTART:${dt(a.start)}`,`DTEND:${dt(a.end)}`,'SUMMARY:Clinic appointment','END:VEVENT','END:VCALENDAR',''].join('\r\n'));});
- app.post('/api/chat',async(req,res,next)=>{try{requireThat(chatAgent,'AI_MODULE_NOT_CONNECTED','Conversational agent provider is not configured',501);const input=z.object({message:z.string().trim().min(1).max(4000),language:contracts.language}).strict().parse(req.body);const now=engine.now();for(const [key,value] of chatStates)if(value.expiresAt<=now)chatStates.delete(key);const key=`${res.locals.clinic}:${res.locals.session}`;const prior=chatStates.get(key)?.state;const result=await chatAgent.handle(input,{clinicId:res.locals.clinic,sessionId:res.locals.session},prior);if(result.briefingCandidate){try{engine.consent(res.locals.clinic,res.locals.session,true);const booking=engine.one("SELECT id FROM appointments WHERE clinic_id=? AND session_id=? AND state='CONFIRMED' ORDER BY start DESC LIMIT 1",res.locals.clinic,res.locals.session);if(booking){const briefing=buildPatientBriefing({patientReportedConcern:result.briefingCandidate,bookingConfirmed:true,consentRecorded:true});if(briefing)engine.briefing(res.locals.clinic,res.locals.session,booking.id,`${briefing.concern}\n\n${briefing.disclaimer}`,options.briefingDestination??process.env.BRIEFING_TEST_EMAIL);}}catch{/* Optional briefing is dropped unless both backend consent and a confirmed booking are present. */}}const actions=result.actions.map(action=>contracts.ChatAction.parse(action));if(chatStates.size>=10000&&!chatStates.has(key))chatStates.delete(chatStates.keys().next().value!);chatStates.set(key,{state:result.state,expiresAt:now+86400000});ok(res,{message:result.message,language:result.language,actions});}catch(error){next(error);}});
+ app.post('/api/chat',async(req,res,next)=>{try{requireThat(chatAgent,'AI_MODULE_NOT_CONNECTED','Conversational agent provider is not configured',501);const input=z.object({message:z.string().trim().min(1).max(4000),language:contracts.language}).strict().parse(req.body);const now=engine.now();for(const [key,value] of chatStates)if(value.expiresAt<=now)chatStates.delete(key);const key=`${res.locals.clinic}:${res.locals.session}`;const prior=chatStates.get(key)?.state;const result=await chatAgent.handle(input,{clinicId:res.locals.clinic,sessionId:res.locals.session},prior);if(result.briefingCandidate){try{engine.consent(res.locals.clinic,res.locals.session,true);const bookings=engine.all("SELECT id FROM appointments WHERE clinic_id=? AND session_id=? AND state='CONFIRMED' LIMIT 2",res.locals.clinic,res.locals.session);if(bookings.length===1){const [booking]=bookings;const briefing=buildPatientBriefing({patientReportedConcern:result.briefingCandidate,bookingConfirmed:true,consentRecorded:true});if(briefing)engine.briefing(res.locals.clinic,res.locals.session,booking.id,`${briefing.concern}\n\n${briefing.disclaimer}`,options.briefingDestination??process.env.BRIEFING_TEST_EMAIL);}}catch{/* Optional briefing is dropped unless both backend consent and a confirmed booking are present. */}}const actions=result.actions.map(action=>contracts.ChatAction.parse(action));if(chatStates.size>=10000&&!chatStates.has(key))chatStates.delete(chatStates.keys().next().value!);chatStates.set(key,{state:result.state,expiresAt:now+86400000});ok(res,{message:result.message,language:result.language,actions});}catch(error){next(error);}});
  // Mock clinic management system: real HTTP boundary, state in separate tables.
  app.use('/mock',(req,_res,next)=>{if(!equal(String(req.headers['x-mock-key']??''),options.mockKey))return next(new Fault('MOCK_AUTH_REQUIRED','Mock authentication required',401));next();});
  app.get('/mock/:clinic/bookings/:id',(req,res)=>{
