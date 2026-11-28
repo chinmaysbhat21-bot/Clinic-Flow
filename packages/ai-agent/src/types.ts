@@ -71,6 +71,12 @@ export interface ToolContext {
   sessionId: string;
 }
 
+export interface IntentExtractionContext extends Pick<AgentState, "intent" | "serviceName" | "doctorName" | "preferredDate" | "timePreference"> {
+  /** Verified clinic catalog names; used only to resolve multilingual follow-up selections. */
+  doctorOptions?: string[];
+  serviceOptions?: string[];
+}
+
 export interface Doctor {
   id: string;
   name: string;
@@ -110,7 +116,7 @@ export interface AgentTools {
 }
 
 export interface IntentExtractor {
-  extract(message: string, language: Language, currentDate: string, context?: Pick<AgentState, "intent" | "serviceName" | "doctorName" | "preferredDate" | "timePreference">): Promise<ExtractedIntent>;
+  extract(message: string, language: Language, currentDate: string, context?: IntentExtractionContext): Promise<ExtractedIntent>;
   translateFaq?(answer: string, language: Language): Promise<string>;
 }
 
@@ -118,4 +124,12 @@ export interface AgentConfig {
   now?: () => Date;
   timezone?: string;
   maxSlots?: number;
+  /** Receives a sanitized failure category without provider messages or request content. */
+  onExtractionFailure?: (diagnostic: ExtractionFailureDiagnostic) => void;
+}
+
+export interface ExtractionFailureDiagnostic {
+  stage: "context_preparation" | "intent_extraction";
+  kind: "invalid_output" | "timeout" | "provider_error" | "unexpected_error";
+  status?: number;
 }
